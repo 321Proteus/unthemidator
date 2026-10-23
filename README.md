@@ -58,6 +58,10 @@ Some binaries rely on custom modules shipped with the program. You can simply pu
 in the `modules` directory before unpacking such binaries. The same can be done for missing system 
 modules, which is useful if you're running unthemidator on a Unix system.
 
+#### Reporting Issues
+
+If you have a problem or something isn't working as intended (or not working at all), create an issue in this repository.
+
 ## Download
 
 Check out the [Releases](https://github.com/x86rc/unthemidator/releases) page to find precompiled unthemidator. 
