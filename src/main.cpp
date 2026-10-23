@@ -1,0 +1,445 @@
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <charconv>
+#include <filesystem>
+
+#include "emulator/hooks.hpp"
+#include "helpers/utils.hpp"
+#include "helpers/json.hpp"
+#include "unpacker/c_themida_unpacker.hpp"
+#include "pe/c_pe_builder.hpp"
+
+int main(int argc, char *argv[]) {
+    struct s_cli_options : s_unpacker_options {
+        std::string m_output_path;
+        std::string m_imports_path;
+        std::string m_vms_path;
+        bool m_skip_startup = false;
+    } options{};
+
+    std::string input_path;
+
+    try {
+        bool positional_only = false;
+        bool has_input = false;
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+
+            if (!positional_only && (arg == "--help" || arg == "-h")) {
+                std::cout << "Usage: unthemidator [options] <path_to_binary>\n"
+                    "  --out-file <path>      Output PE (default: <name>.unpacked.<extension>)\n"
+                    "  --imports-file <path> Imports JSON (default: <name>.imports.json)\n"
+                    "  --vms-file <path>     VM entries JSON (default: <name>.vms.json)\n"
+                    "  --vm-depth <0..65535> Virtualization layers to explore (default: 0)\n"
+                    "  --no-imp             Skip imports lookup\n"
+                    "  --no-startup         Only unpack the initial boot stage\n"
+                    "  --no-vm-lookup       Skip virtual machines lookup\n"
+                    "  --no-loader          Skip fixer loader generation\n";
+                return 0;
+            }
+
+            if (!positional_only && arg == "--") {
+                positional_only = true;
+                continue;
+            }
+
+            if (!positional_only && (arg == "--out-file" || arg == "--imports-file" || arg == "--vms-file" ||
+                arg == "--vm-depth")) {
+                if (++i == argc || !argv[i][0] || std::string_view(argv[i]).starts_with("--")) {
+                    throw std::runtime_error("missing value for " + arg);
+                }
+
+                const std::string value = argv[i];
+
+                if (arg == "--out-file") {
+                    options.m_output_path = value;
+                } else if (arg == "--imports-file") {
+                    options.m_imports_path = value;
+                } else if (arg == "--vms-file") {
+                    options.m_vms_path = value;
+                } else {
+                    uint16_t depth = 0;
+                    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), depth);
+
+                    if (error != std::errc{} || end != value.data() + value.size()) {
+                        throw std::runtime_error("--vm-depth must be an integer from 0 to 65535");
+                    }
+
+                    options.m_max_nested_vms = depth;
+                }
+            } else if (!positional_only && arg == "--no-imp") {
+                options.m_skip_imports = true;
+            } else if (!positional_only && arg == "--no-startup") {
+                options.m_skip_startup = true;
+            } else if (!positional_only && arg == "--no-vm-lookup") {
+                options.m_skip_vm_lookup = true;
+            } else if (!positional_only && arg == "--no-loader") {
+                options.m_skip_loader = true;
+            } else if (!positional_only && arg.starts_with('-')) {
+                throw std::runtime_error("unknown option: " + arg);
+            } else {
+                if (has_input || arg.empty()) {
+                    throw std::runtime_error("expected one input binary");
+                }
+
+                input_path = arg;
+                has_input = true;
+            }
+        }
+
+        if (!has_input) {
+            throw std::runtime_error("input binary is required: unthemidator [options] <path_to_binary>");
+        }
+
+        const std::filesystem::path input(input_path);
+        const auto stem = input.parent_path() / input.stem();
+
+        if (options.m_output_path.empty()) {
+            options.m_output_path = stem.string() + ".unpacked" + input.extension().string();
+        }
+
+        if (options.m_imports_path.empty()) {
+            options.m_imports_path = stem.string() + ".imports.json";
+        }
+
+        if (options.m_vms_path.empty()) {
+            options.m_vms_path = stem.string() + ".vms.json";
+        }
+
+        const std::filesystem::path paths[] = { input, options.m_output_path, options.m_imports_path, options.m_vms_path };
+        for (size_t i = 0; i < std::size(paths); ++i) {
+            for (size_t j = 0; j < i; ++j) {
+                if (std::filesystem::weakly_canonical(paths[i]) == std::filesystem::weakly_canonical(paths[j]) ||
+                    (std::filesystem::exists(paths[i]) && std::filesystem::exists(paths[j]) &&
+                    std::filesystem::equivalent(paths[i], paths[j]))) {
+                    throw std::runtime_error("input and output paths must be distinct");
+                }
+            }
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "[unthemidator] " << e.what() << std::endl;
+        return 1;
+    }
+
+    const auto &output_path = options.m_output_path;
+    std::cout << "[unthemidator] loading pe file..." << std::endl;
+
+    printf("file name %s , output - %s\n", input_path.c_str(), output_path.c_str());
+
+    auto raw = utils::read_file(input_path);
+
+    if (raw.empty()) {
+        std::cerr << "failed to read file" << std::endl;
+        return 1;
+    }
+
+    std::shared_ptr<c_pe_image> pe_image;
+    std::shared_ptr<c_emulator> emulator;
+    std::shared_ptr<c_emulator_ctx> emulator_ctx;
+
+    std::cout << "[pe] parsing PE file..." << std::endl;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    try {
+        pe_image = std::make_shared<c_pe_image>(raw);
+    } catch (std::runtime_error& e) {
+        std::cerr << "[pe] failed to parse: " << e.what() << std::endl;
+        return 1;
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    std::cout << "[pe] successfully parsed PE file in " << duration << " ms" << std::endl;
+    std::cout << "  [pe] image base: 0x" << std::hex << pe_image->get_image_base() << std::dec << std::endl;
+    std::cout << "  [pe] entry point: 0x" << std::hex << pe_image->get_image_base() + pe_image->get_entry_rva() << std::dec << std::endl;
+    std::cout << "  [pe] binary type: " << (pe_image->is_x64() ? "AMD64 (x86_64, 64-bit)" : "x86 (32-bit)") << std::endl;
+
+    auto memory_manager = std::make_shared<c_memory_manager>(pe_image);
+
+    std::cout << "[emulator] setting up..." << std::endl;
+
+    start = std::chrono::high_resolution_clock::now();
+
+    // setup unicorn
+    try {
+        emulator = std::make_shared<c_emulator>(
+            pe_image->is_x64() ? e_architecture::k_amd64 : e_architecture::k_x86,
+            input_path.ends_with(".sys") ? e_platform::k_windows_driver : e_platform::k_windows,
+            memory_manager);
+
+        emulator_ctx = emulator->create_context();
+
+        // preload modules APIs of which we hook
+        emulator_ctx->get_imports()->load_module("ntdll.dll");
+        emulator_ctx->get_imports()->load_module("kernel32.dll");
+        emulator_ctx->get_imports()->load_module("user32.dll");
+        emulator_ctx->get_imports()->load_module("advapi32.dll");
+        emulator_ctx->get_imports()->load_module("shell.dll");
+
+        // create API hooks
+        using api_hook_t = std::pair<std::function<void(c_emulator_ctx*)>, uint32_t>;
+        std::unordered_map<std::string, std::unordered_map<std::string, api_hook_t>> api_hooks = {
+            {
+                "kernel32.dll",
+                {
+                    { "GetModuleHandleA", { hooks::get_module_handle, 1 } },
+                    { "GetModuleHandleW", { hooks::get_module_handle, 1 } },
+                    { "LoadLibraryA", { hooks::get_module_handle, 1 } },
+                    { "LoadLibraryW", { hooks::get_module_handle, 1 } },
+                    { "GetProcAddress", { hooks::get_proc_address, 2 } },
+                    { "GetCommandLineA", { hooks::get_command_line_a, 0 } },
+                    { "GetVersion", { hooks::get_version, 0 } },
+                    { "VirtualAlloc", { hooks::virtual_alloc, 4 } },
+                    { "GetCurrentDirectoryW", { hooks::get_current_dir, 2 } },
+                    { "GetModuleFileNameW", { hooks::get_module_filename, 3 } },
+                    { "VirtualProtect", { hooks::virtual_protect, 4 } },
+                    { "RaiseException", { hooks::raise_exception, 4 } },
+                    { "CheckRemoteDebuggerPresent", { hooks::check_remote_debugger, 2 } },
+                    { "IsWow64Process", { hooks::is_wow64_process, 2 } },
+                    { "GetFileSize", { hooks::get_file_size, 2 } },
+                    { "MapViewOfFile", { hooks::map_view_of_file, 5 } },
+
+                    { "CreateFileW", { hooks::dummy_true_function, 7 } },
+                    { "CreateFileMappingW", { hooks::dummy_true_function, 6 } },
+                    { "UnmapViewOfFile", { hooks::dummy_true_function, 1 } },
+                    { "GetUserDefaultUILanguage", { hooks::dummy_function, 0 } },
+                    { "GetThreadContext", { hooks::get_thread_context, 2 } },
+                    { "IsBadWritePtr", { hooks::dummy_function, 2 } },
+                    { "IsBadReadPtr", { hooks::dummy_true_function, 2 } },
+                    { "GetProcessHeap", { hooks::dummy_true_function, 0 } },
+                    { "OpenThreadToken", { hooks::dummy_true_function, 4 } },
+                    { "SetCurrentDirectoryW", { hooks::dummy_true_function, 1 } },
+                    { "GetCurrentProcess", { hooks::dummy_true_function, 0 } },
+                    { "CloseHandle", { hooks::close_handle, 1 } },
+                    { "GetCurrentProcessId", { hooks::get_current_process_id, 0 } },
+                    { "GetCurrentThreadId", { hooks::get_current_thread_id, 0 } },
+                    { "GetLastError", { hooks::get_last_error, 0 } },
+                    { "SetLastError", { hooks::set_last_error, 1 } },
+                    { "GetCurrentThread", { hooks::dummy_true_function, 0 } },
+                    { "OpenThread", { hooks::dummy_true_function, 3 } },
+                    { "VirtualFree", { hooks::dummy_true_function, 3 } },
+                    { "CreateToolhelp32Snapshot", { hooks::create_toolhelp_snapshot, 2 } },
+                    { "Process32First", { hooks::process_first, 2 } },
+                    { "Process32FirstW", { hooks::process_first_w, 2 } },
+                    { "Process32Next", { hooks::process_next, 2 } },
+                    { "Process32NextW", { hooks::process_next_w, 2 } },
+                    { "lstrcmpiA", { hooks::dummy_true_function, 2 } },
+                    { "GetSystemFirmwareTable", { hooks::dummy_function, 4 } },
+                }
+            },
+            {
+                "ntdll.dll",
+                {
+                    { "RtlAllocateHeap", { hooks::rtl_allocate_heap, 3 } },
+                    { "RtlAddVectoredExceptionHandler", { hooks::add_veh, 2 } },
+                    { "RtlRemoveVectoredExceptionHandler", { hooks::remove_veh, 1 } },
+                    { "ZwQueryInformationProcess", { hooks::nt_query_information_process, 5 } },
+                    { "NtQueryInformationProcess", { hooks::nt_query_information_process, 5 } },
+                    { "ZwQuerySystemInformation", { hooks::nt_query_system_information, 4 } },
+                    { "NtQuerySystemInformation", { hooks::nt_query_system_information, 4 } },
+                    { "ZwProtectVirtualMemory", { hooks::nt_protect_virtual_memory, 5 } },
+                    { "NtProtectVirtualMemory", { hooks::nt_protect_virtual_memory, 5 } },
+
+                    { "RtlInitializeCriticalSection", { hooks::dummy_function, 1 } },
+                    { "ZwSetInformationThread", { hooks::dummy_function, 4 } },
+                    { "NtSetInformationThread", { hooks::dummy_function, 4 } },
+                    { "RtlFreeHeap", { hooks::dummy_true_function, 3 } },
+                    { "ZwFlushInstructionCache", { hooks::dummy_function, 3 } },
+                    { "NtFlushInstructionCache", { hooks::dummy_function, 3 } },
+                }
+            },
+            {
+                "user32.dll",
+                {
+                    { "MessageBoxExW", { hooks::message_box_ex_w, 5 } }, // never called unless there's an error
+                    { "MessageBoxExA", { hooks::message_box_ex_w, 5 } }, // never called unless there's an error
+
+                    { "FindWindowA", { hooks::dummy_function, 2 } },
+                    { "GetWindowTextA", { hooks::dummy_function, 3 } },
+                    { "GetForegroundWindow", { hooks::dummy_true_function, 0 } },
+                }
+            },
+            {
+                "advapi32.dll",
+                {
+                    { "GetTokenInformation", { hooks::get_token_information, 5 } },
+                    { "OpenThreadToken", { hooks::dummy_true_function, 4 } },
+                    { "RegOpenKeyA", { hooks::dummy_true_function, 3 } },
+                    { "RegQueryValueExA", { hooks::dummy_true_function, 6 } },
+                    { "RegCloseKey", { hooks::dummy_function, 1 } },
+                    { "AllocateAndInitializeSid", { hooks::dummy_true_function, 11 } },
+                    { "FreeSid", { hooks::dummy_true_function, 1 } },
+                }
+            },
+            {
+                "shell32.dll",
+                {
+                    { "IsUserAnAdmin", { hooks::dummy_function, 0 } }
+                }
+            }
+        };
+
+        // setup hooks
+        for (const auto &[mod_name, hooked_apis] : api_hooks) {
+            const auto module_base = emulator_ctx->get_imports()->load_module(mod_name);
+
+            for (const auto &[fn_name, hook_fn] : hooked_apis) {
+                const auto fn_addr = emulator_ctx->get_imports()->resolve_import(module_base, fn_name);
+
+                if (!fn_addr) {
+                    throw std::runtime_error("failed to find export to hook");
+                }
+
+                emulator_ctx->add_hook(fn_addr, fn_name, hook_fn.first, hook_fn.second);
+                memory_manager->tag_region(fn_addr, fn_name);
+            }
+        }
+
+        // resolve imports
+        for (const auto &[mod_name, functions] : pe_image->get_imports()) {
+            const auto module_base = emulator_ctx->get_imports()->load_module(mod_name);
+
+            for (const auto &[fn_name, iat_entry_orig_va] : functions) {
+                const auto fn_addr = emulator_ctx->get_imports()->resolve_import(module_base, fn_name);
+
+                std::vector<uint8_t> iat_entry(pe_image->get_ptr_size(), 0);
+
+                if (pe_image->is_x64()) {
+                    *reinterpret_cast<uint64_t*>(iat_entry.data()) = fn_addr;
+                } else {
+                    *reinterpret_cast<uint32_t*>(iat_entry.data()) = static_cast<uint32_t>(fn_addr);
+                }
+
+                const auto iat_entry_va = iat_entry_orig_va - pe_image->get_image_base() + memory_manager->get_image_base();
+
+                memory_manager->write_memory(iat_entry_va, iat_entry);
+                uc_mem_write(emulator_ctx->get_uc(), iat_entry_va, iat_entry.data(), iat_entry.size());
+            }
+        }
+    } catch (std::runtime_error &e) {
+        std::cerr << "[emulator] failed to setup emulator: " << e.what() << std::endl;
+        return 1;
+    }
+
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    std::cout << "[emulator] initialized emulator in " << duration << " ms" << std::endl << std::endl;
+
+    // create unpacker instance
+    const auto unpacker = std::make_shared<c_themida_unpacker>(options, pe_image, emulator_ctx, memory_manager);
+
+    // decompress binary (if it's compressed)
+    try {
+       unpacker->decompress_bin();
+    } catch (std::runtime_error &e) {
+        std::cerr << "[unthemidator] failed to decompress binary: " << e.what() << std::endl;
+
+        return 1; // decompression is a critical stage, if it fails, we can't proceed further
+    }
+
+    std::cout << std::endl;
+
+    // startup Themida runtime (lightning VM entrypoint)
+    try {
+        if (!options.m_skip_startup) {
+            unpacker->startup();
+        }
+    } catch (std::runtime_error &e) {
+        std::cerr << "[unthemidator] failed to startup: " << e.what() << std::endl;
+
+        return 1; // startup is a critical stage, if it fails, we can't proceed further
+    }
+
+    std::cout << std::endl;
+
+    // find all Themida entry points and decompress the VMs (if applicable)
+    try {
+        if (!options.m_skip_startup && !options.m_skip_vm_lookup) {
+            unpacker->decompress_vms();
+        }
+    } catch (std::runtime_error &e) {
+        std::cerr << "[unthemidator] failed to decompress VMs: " << e.what() << std::endl;
+    }
+
+    std::cout << std::endl;
+
+    start = std::chrono::high_resolution_clock::now();
+
+    // rebuild unpacked PE file
+    const auto pe_builder = std::make_shared<c_pe_builder>(pe_image, memory_manager);
+
+    pe_builder->set_entry_rva(unpacker->get_oep_rva());
+    pe_builder->set_imports(unpacker->get_recovered_imports());
+
+    if (!options.m_skip_loader) {
+        pe_builder->set_loader_shellcode(unpacker->get_loader_shellcode());
+    }
+
+    try {
+        pe_builder->build();
+
+        // save rebuilt PE file
+        const auto &bin = pe_builder->get_built_pe();
+
+        std::ofstream output_file(output_path, std::ios::binary);
+        output_file.exceptions(std::ios::failbit | std::ios::badbit);
+        output_file.write(reinterpret_cast<const char*>(bin.data()), static_cast<long long>(bin.size()));
+        output_file.close();
+
+        auto imports = nlohmann::json::array();
+        auto vms = nlohmann::json::array();
+
+        for (const auto &entry : unpacker->get_recovered_imports()) {
+            imports.push_back({
+                { "iat_rva", entry.m_iat_rva },
+                { "module", entry.m_module },
+                { "function", entry.m_function },
+                { "is_ordinal", entry.m_is_ordinal },
+                { "ordinal", entry.m_ordinal },
+            });
+        }
+
+        for (const auto &entry : unpacker->get_vm_trampolines()) {
+            vms.push_back({
+                { "trampoline_address", entry.m_trampoline_address },
+                { "vm_enter_address", entry.m_vm_enter_address },
+                { "is_packed", entry.m_is_packed },
+            });
+        }
+
+        for (const auto &[path, report] : {
+            std::pair{ options.m_imports_path, &imports }, std::pair{ options.m_vms_path, &vms } }) {
+            //
+            std::ofstream file(path);
+            file.exceptions(std::ios::failbit | std::ios::badbit);
+            file << report->dump(4) << '\n';
+            file.close();
+        }
+    } catch (std::runtime_error &e) {
+        std::cerr << "[unthemidator] failed to build PE file: " << e.what() << std::endl;
+
+        return 1;
+    }
+
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    std::cout << "[unthemidator] PE built in " << duration <<
+        " ms, saved unpacked PE file: " << output_path << std::endl;
+
+    std::cout << "[unthemidator] Detected Themida version: " << unpacker->get_themida_version() << std::endl;
+
+    if (argc == 1) {
+        std::cout << std::endl << "[unthemidator] press any key to exit..." << std::endl;
+        std::cin.get();
+    }
+
+    return 0;
+}

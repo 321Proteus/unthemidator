@@ -1,0 +1,855 @@
+#include <array>
+#include <fstream>
+#include <sstream>
+#include <utility>
+
+#include "c_emulator.hpp"
+#include "windows.hpp"
+
+#include "../memory/c_memory_manager.hpp"
+#include "../pe/c_pe_image.hpp"
+#include "../unpacker/c_themida_unpacker.hpp"
+
+#undef min
+#undef max
+
+static void code_callback(uc_engine *uc, const uint64_t address, const uint32_t size, void* cb) {
+    (*static_cast<std::function<code_callback_t>*>(cb))(uc, address, size);
+}
+
+static void mem_callback(uc_engine *uc, const uc_mem_type type, const uint64_t address,
+    const int size, const int64_t value, void* cb) {
+    //
+    (*static_cast<std::function<mem_callback_t>*>(cb))(uc, type, address, size, value);
+}
+
+static bool mem_prot_callback(uc_engine*, const uc_mem_type, const uint64_t, const int, const int64_t, void*) {
+    return true;
+}
+
+static int cpuid_callback(uc_engine *uc, void*) {
+    uint32_t eax_in, ecx_in;
+    uc_reg_read(uc, UC_X86_REG_EAX, &eax_in);
+    uc_reg_read(uc, UC_X86_REG_ECX, &ecx_in);
+
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+
+    switch (eax_in) {
+        case 0x0: {
+            // max basic leaf + vendor string "AuthenticAMD"
+            eax = 0x00000010; // max supported basic leaf (leaf 0x10 on Zen 3)
+            ebx = 0x68747541; // "Auth"
+            edx = 0x69746E65; // "enti"
+            ecx = 0x444D4163; // "cAMD"
+            break;
+        }
+
+        case 0x1: {
+            eax = (0x0A << 20) | (0x2 << 16) | (0xF << 8) | (0x1 << 4) | 0x0;
+            ebx = (0x00 << 24) | (32 << 16) | (8 << 8) | 0x00;
+            ecx = (1u <<  0) | (1u <<  1) | (1u <<  3) |
+                  (1u <<  9) | (1u << 12) | (1u << 13) |
+                  (1u << 19) | (1u << 20) | (1u << 22) |
+                  (1u << 23) | (1u << 25) | (1u << 26) |
+                  (1u << 27) | (1u << 28) | (1u << 29) |
+                  (1u << 30);
+            edx = (1u <<  0) | (1u <<  1) | (1u <<  2) | (1u <<  3) |
+                  (1u <<  4) | (1u <<  5) | (1u <<  6) | (1u <<  7) |
+                  (1u <<  8) | (1u <<  9) | (1u << 11) | (1u << 12) |
+                  (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) |
+                  (1u << 17) | (1u << 19) | (1u << 23) | (1u << 24) |
+                  (1u << 25) | (1u << 26) | (1u << 28);
+
+            break;
+        }
+
+        default:
+            // leaf not implemented — return zeros
+            break;
+    }
+
+    uc_reg_write(uc, UC_X86_REG_EAX, &eax);
+    uc_reg_write(uc, UC_X86_REG_EBX, &ebx);
+    uc_reg_write(uc, UC_X86_REG_ECX, &ecx);
+    uc_reg_write(uc, UC_X86_REG_EDX, &edx);
+
+    return 1;
+}
+
+static bool dispatch_hook(uc_engine *uc, const uint64_t address, c_emulator_ctx* ctx) {
+    const auto hook = ctx->get_hook(address);
+
+    if (ctx->get_themida_unpacker() && ctx->get_themida_unpacker()->should_stop(address)) {
+        ctx->set_pc(address);
+        uc_emu_stop(uc);
+
+        return false;
+    }
+
+    const auto is_x86 = ctx->get_arch() == e_architecture::k_x86;
+    const auto sp_reg = is_x86 ? UC_X86_REG_ESP : UC_X86_REG_RSP;
+    auto sp = ctx->get_x86_reg_value(sp_reg);
+    const auto ret_addr = is_x86 ? ctx->read<uint32_t>(sp).value() : ctx->read<uint64_t>(sp).value();
+
+    if (!hook) {
+        printf("exception thrown - 0x%llX (ret addy 0x%llX)\n", address, ret_addr);
+
+        throw std::runtime_error("unexpected bp!");
+    }
+
+    //printf("[+] calling %s from 0x%llX, ret addr 0x%llX...\n", hook->m_name.c_str(), address, ret_addr);
+
+    const auto arg_count = hook->m_arg_count;
+    hook->m_function(ctx);
+
+    // adjust SP as if a RET has been made
+    sp += is_x86 ? sizeof(uint32_t) * (1ULL + arg_count) : sizeof(uint64_t);
+
+    ctx->set_x86_reg_value(sp_reg, sp);
+    ctx->set_pc(ret_addr);
+    return true;
+}
+
+static void int_callback(uc_engine *uc, const int exception, c_emulator_ctx* ctx) {
+    if (exception != 3) {
+        throw std::runtime_error("emulator ctx: unexpected interruption/exception");
+    }
+
+    // unicorn automatically steps forward after int3 exception occurs so to get actual address of breakpoint
+    // we should calculate previous RIP which is current_rip - 0x1 (sizeof(int3))
+    // (https://github.com/unicorn-engine/unicorn/issues/1027)
+    const auto int3_addr = ctx->get_pc() - 0x1;
+    dispatch_hook(uc, int3_addr, ctx);
+}
+
+bool c_emulator_ctx::fetch_prot_callback(uc_engine *uc, uc_mem_type, const uint64_t address, int, int64_t, c_emulator_ctx* ctx) {
+    if (!ctx->get_hook(address)) {
+        return false;
+    }
+
+    if (dispatch_hook(uc, address, ctx)) {
+        ctx->m_hook_resume = ctx->get_pc();
+    }
+    uc_emu_stop(uc);
+    return false;
+}
+
+c_emulator_ctx::c_emulator_ctx(c_emulator* emulator, uc_engine *uc, const std::shared_ptr<c_memory_manager>& memory_manager) :
+    m_uc(uc), m_emulator(emulator), m_memory_manager(memory_manager) {
+    //
+
+    // setup interruption hook
+    {
+        uc_hook_add(m_uc, &m_int_trace, UC_HOOK_INTR, reinterpret_cast<void*>(int_callback),
+            reinterpret_cast<void*>(this), 1, 0);
+    }
+
+    // setup cpuid hook
+    {
+        uc_hook_add(m_uc, &m_cpuid_trace, UC_HOOK_INSN, reinterpret_cast<void*>(cpuid_callback),
+            nullptr, 1, 0, UC_X86_INS_CPUID);
+    }
+
+    uc_hook_add(m_uc, &m_fetch_trace, UC_HOOK_MEM_FETCH_PROT, reinterpret_cast<void*>(fetch_prot_callback),
+        this, 1, 0);
+
+    uc_hook_add(m_uc, &m_prot_trace, UC_HOOK_MEM_READ_PROT | UC_HOOK_MEM_WRITE_PROT,
+        reinterpret_cast<void*>(mem_prot_callback), nullptr, 1, 0);
+
+    m_imports = std::make_shared<c_imports>(this);
+}
+
+c_emulator_ctx::~c_emulator_ctx() {
+    uc_hook_del(m_uc, m_int_trace);
+    uc_hook_del(m_uc, m_fetch_trace);
+    uc_hook_del(m_uc, m_prot_trace);
+    uc_hook_del(m_uc, m_cpuid_trace);
+
+    uc_close(m_uc);
+}
+
+e_architecture c_emulator_ctx::get_arch() const {
+    return m_emulator->get_arch();
+}
+
+uc_engine* c_emulator_ctx::get_uc() const {
+    return m_uc;
+}
+
+std::shared_ptr<c_memory> c_emulator_ctx::get_memory() const {
+    return m_memory_manager;
+}
+
+std::shared_ptr<c_imports> c_emulator_ctx::get_imports() const {
+    return m_imports;
+}
+
+c_themida_unpacker * c_emulator_ctx::get_themida_unpacker() const {
+    return m_themida_unpacker;
+}
+
+std::vector<uint8_t> c_emulator_ctx::get_original_file_mapping() const {
+    return m_memory_manager->get_pe_image()->get_original_mapping();
+}
+
+void c_emulator_ctx::set_themida_unpacker(c_themida_unpacker *unpacker) {
+    m_themida_unpacker = unpacker;
+}
+
+uint64_t c_emulator_ctx::get_x86_reg_value(const uc_x86_reg reg) const {
+    uint64_t reg_value = 0;
+    uc_reg_read(m_uc, reg, &reg_value);
+
+    return reg_value;
+}
+
+void c_emulator_ctx::set_x86_reg_value(const uc_x86_reg reg, const uint64_t value) const {
+    uc_reg_write(m_uc, reg, &value);
+}
+
+uint64_t c_emulator_ctx::get_arg(const uint32_t index) const {
+    if (get_arch() == e_architecture::k_x86) {
+        return read<uint32_t>(get_x86_reg_value(UC_X86_REG_ESP) + 4ULL * (index + 1ULL)).value();
+    }
+
+    constexpr std::array regs = { UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9 };
+    if (index < regs.size()) {
+        return get_x86_reg_value(regs[index]);
+    }
+
+    return read<uint64_t>(get_x86_reg_value(UC_X86_REG_RSP) + 8ULL * (index + 1ULL)).value();
+}
+
+void c_emulator_ctx::set_arg(const uint32_t index, const uint64_t value) const {
+    if (get_arch() == e_architecture::k_x86) {
+        if (!write<uint32_t>(get_x86_reg_value(UC_X86_REG_ESP) + 4ULL * (index + 1ULL), static_cast<uint32_t>(value))) {
+            throw std::runtime_error("emulator ctx: failed to write argument");
+        }
+        return;
+    }
+
+    constexpr std::array regs = { UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9 };
+    if (index < regs.size()) {
+        set_x86_reg_value(regs[index], value);
+        return;
+    }
+
+    if (!write<uint64_t>(get_x86_reg_value(UC_X86_REG_RSP) + 8ULL * (index + 1ULL), value)) {
+        throw std::runtime_error("emulator ctx: failed to write argument");
+    }
+}
+
+void c_emulator_ctx::set_result(const uint64_t value) const {
+    set_x86_reg_value(get_arch() == e_architecture::k_x86 ? UC_X86_REG_EAX : UC_X86_REG_RAX, value);
+}
+
+void c_emulator_ctx::add_hook(const uint64_t address, const std::string& name,
+    const std::function<void(c_emulator_ctx *)> &hook, const uint32_t arg_count) {
+    m_hooks.emplace(address, s_hooked_function{
+        .m_address = address,
+        .m_name = name,
+        .m_function = hook,
+        .m_arg_count = arg_count
+    });
+}
+
+void c_emulator_ctx::remove_hook(const uint64_t address) {
+    m_hooks.erase(address);
+}
+
+void c_emulator_ctx::add_mem_hook(const uc_hook_type hook_type, std::function<mem_callback_t> callback,
+    const uint64_t start_address, const uint64_t end_address) {
+    //
+    m_mem_hooks[start_address] = s_mem_hook{
+        .m_trace = {},
+        .m_hook = std::move(callback),
+    };
+
+    uc_hook_add(m_uc, &m_mem_hooks.at(start_address).m_trace, hook_type, reinterpret_cast<void*>(mem_callback),
+        reinterpret_cast<void*>(&m_mem_hooks.at(start_address).m_hook), start_address, end_address);
+}
+
+void c_emulator_ctx::remove_mem_hook(const uint64_t address) {
+    if (!m_mem_hooks.contains(address)) {
+        return;
+    }
+
+    uc_hook_del(m_uc, m_mem_hooks.at(address).m_trace);
+    m_mem_hooks.erase(address);
+}
+
+void c_emulator_ctx::add_exception_handler(const uint64_t address) {
+    m_exception_handlers.insert(address);
+}
+
+void c_emulator_ctx::remove_exception_handler(const uint64_t address) {
+    m_exception_handlers.erase(address);
+}
+
+void c_emulator_ctx::raise_exception(const uint32_t exception_code) {
+    if (m_exception_handlers.empty()) {
+        return;
+    }
+
+    if (!m_exception_stack) {
+        m_exception_stack = allocate_storage(0x1000);
+    }
+
+    if (!m_exception_return_address) {
+        m_exception_return_address = allocate_storage(0x1000);
+    }
+
+    const auto is_x86 = get_arch() == e_architecture::k_x86;
+
+    constexpr uint64_t k_stack_size = 0x1000;
+    constexpr uint64_t k_record_offset = 0x00;
+    constexpr uint64_t k_pointers_offset = 0xA0;
+    constexpr uint64_t k_context_offset = 0x100;
+    constexpr size_t k_context_size = 0x4D0;
+    const auto context_size = is_x86 ? 0x2CC : k_context_size;
+
+    uc_context *saved = nullptr;
+
+    if (uc_context_alloc(m_uc, &saved) != UC_ERR_OK) {
+        throw std::runtime_error("failed to allocate exception context");
+    }
+
+    const std::unique_ptr<uc_context, decltype(&uc_context_free)> original(saved, uc_context_free);
+
+    if (uc_context_save(m_uc, saved) != UC_ERR_OK) {
+        throw std::runtime_error("failed to save exception context");
+    }
+
+    const auto record_address = m_exception_stack + k_record_offset;
+    const auto pointers_address = m_exception_stack + k_pointers_offset;
+    const auto context_address = m_exception_stack + k_context_offset;
+    const auto return_address = m_exception_return_address;
+    const auto stack_pointer = m_exception_stack + k_stack_size - 0x28;
+
+    unthemidator::windows::s_exception_record record{};
+    record.exception_code = exception_code;
+    record.exception_address = get_pc();
+
+    unthemidator::windows::s_exception_pointers pointers{};
+    pointers.exception_record = record_address;
+    pointers.context_record = context_address;
+
+    std::array<uint8_t, k_context_size> context{};
+
+    const auto write_field = [&](const size_t offset, const auto value) {
+        memcpy(context.data() + offset, &value, sizeof(value));
+    };
+
+    if (is_x86) {
+        write_field(0, uint32_t{0x00010007});
+    } else {
+        write_field(0x30, uint32_t{0x00100003});
+    }
+
+    constexpr std::array x86_regs = {
+        UC_X86_REG_GS, UC_X86_REG_FS, UC_X86_REG_ES, UC_X86_REG_DS,
+        UC_X86_REG_EDI, UC_X86_REG_ESI, UC_X86_REG_EBX, UC_X86_REG_EDX, UC_X86_REG_ECX, UC_X86_REG_EAX,
+        UC_X86_REG_EBP, UC_X86_REG_EIP, UC_X86_REG_CS, UC_X86_REG_EFLAGS, UC_X86_REG_ESP, UC_X86_REG_SS
+    };
+
+    const auto capture = [&](const size_t offset, const uc_x86_reg reg) {
+        write_field(offset, get_x86_reg_value(reg));
+    };
+
+    if (is_x86) {
+        for (size_t i = 0; i < x86_regs.size(); ++i) {
+            write_field(0x8C + i * 4, static_cast<uint32_t>(get_x86_reg_value(x86_regs[i])));
+        }
+    } else {
+        capture(0x78, UC_X86_REG_RAX);
+        capture(0x80, UC_X86_REG_RCX);
+        capture(0x88, UC_X86_REG_RDX);
+        capture(0x90, UC_X86_REG_RBX);
+        capture(0x98, UC_X86_REG_RSP);
+        capture(0xA0, UC_X86_REG_RBP);
+        capture(0xA8, UC_X86_REG_RSI);
+        capture(0xB0, UC_X86_REG_RDI);
+        capture(0xB8, UC_X86_REG_R8);
+        capture(0xC0, UC_X86_REG_R9);
+        capture(0xC8, UC_X86_REG_R10);
+        capture(0xD0, UC_X86_REG_R11);
+        capture(0xD8, UC_X86_REG_R12);
+        capture(0xE0, UC_X86_REG_R13);
+        capture(0xE8, UC_X86_REG_R14);
+        capture(0xF0, UC_X86_REG_R15);
+        capture(0xF8, UC_X86_REG_RIP);
+
+        write_field(0x44, static_cast<uint32_t>(get_x86_reg_value(UC_X86_REG_EFLAGS)));
+    }
+
+    const auto check_write = [&](const uint64_t address, const void *data, const size_t size) {
+        if (uc_mem_write(m_uc, address, data, size) != UC_ERR_OK) {
+            throw std::runtime_error("failed to write exception data");
+        }
+    };
+
+    try {
+        if (is_x86) {
+            std::array<uint32_t, 20> record32{};
+            record32[0] = exception_code;
+            record32[3] = static_cast<uint32_t>(get_pc());
+            const std::array pointers32 = { static_cast<uint32_t>(record_address), static_cast<uint32_t>(context_address) };
+            check_write(record_address, record32.data(), sizeof(record32));
+            check_write(pointers_address, pointers32.data(), sizeof(pointers32));
+        } else {
+            check_write(record_address, &record, sizeof(record));
+            check_write(pointers_address, &pointers, sizeof(pointers));
+        }
+        check_write(context_address, context.data(), context_size);
+
+        for (const auto address : m_exception_handlers) {
+            if (uc_context_restore(m_uc, saved) != UC_ERR_OK) {
+                throw std::runtime_error("failed to restore exception context");
+            }
+
+            check_write(stack_pointer, &return_address, is_x86 ? 4 : 8);
+
+            set_x86_reg_value(is_x86 ? UC_X86_REG_ESP : UC_X86_REG_RSP, stack_pointer);
+            set_arg(0, pointers_address);
+            set_pc(address);
+
+            if (const auto err = emulate(address, return_address, 0);
+                err != UC_ERR_OK) {
+                throw std::runtime_error("exception handler failed to return");
+            }
+
+            if (static_cast<int32_t>(get_x86_reg_value(UC_X86_REG_EAX)) != -1) {
+                continue;
+            }
+
+            if (uc_mem_read(m_uc, context_address, context.data(), context_size) != UC_ERR_OK) {
+                throw std::runtime_error("failed to read exception context");
+            }
+
+            if (uc_context_restore(m_uc, saved) != UC_ERR_OK) {
+                throw std::runtime_error("failed to restore exception context");
+            }
+
+            const auto apply = [&](const size_t offset, const uc_x86_reg reg) {
+                uint64_t value = 0;
+                memcpy(&value, context.data() + offset, sizeof(value));
+                set_x86_reg_value(reg, value);
+            };
+
+            if (is_x86) {
+                for (size_t i = 0; i < x86_regs.size(); ++i) {
+                    uint32_t value = 0;
+                    memcpy(&value, context.data() + 0x8C + i * 4, sizeof(value));
+                    set_x86_reg_value(x86_regs[i], value);
+                }
+            } else {
+                apply(0x78, UC_X86_REG_RAX);
+                apply(0x80, UC_X86_REG_RCX);
+                apply(0x88, UC_X86_REG_RDX);
+                apply(0x90, UC_X86_REG_RBX);
+                apply(0x98, UC_X86_REG_RSP);
+                apply(0xA0, UC_X86_REG_RBP);
+                apply(0xA8, UC_X86_REG_RSI);
+                apply(0xB0, UC_X86_REG_RDI);
+                apply(0xB8, UC_X86_REG_R8);
+                apply(0xC0, UC_X86_REG_R9);
+                apply(0xC8, UC_X86_REG_R10);
+                apply(0xD0, UC_X86_REG_R11);
+                apply(0xD8, UC_X86_REG_R12);
+                apply(0xE0, UC_X86_REG_R13);
+                apply(0xE8, UC_X86_REG_R14);
+                apply(0xF0, UC_X86_REG_R15);
+                apply(0xF8, UC_X86_REG_RIP);
+
+                uint32_t eflags = 0;
+                memcpy(&eflags, context.data() + 0x44, sizeof(eflags));
+                set_x86_reg_value(UC_X86_REG_EFLAGS, eflags);
+            }
+
+            return;
+        }
+    } catch (...) {
+        uc_context_restore(m_uc, saved);
+        throw;
+    }
+
+    if (uc_context_restore(m_uc, saved) != UC_ERR_OK) {
+        throw std::runtime_error("failed to restore original context");
+    }
+}
+
+uint64_t c_emulator_ctx::create_process_snapshot(const uint32_t flags, const uint32_t process_id) const {
+    const auto handle = m_next_snapshot_handle++;
+    m_process_snapshots.emplace(handle, s_process_snapshot{ flags, process_id });
+    return handle;
+}
+
+c_emulator_ctx::s_process_snapshot* c_emulator_ctx::get_process_snapshot(const uint64_t handle) const {
+    const auto it = m_process_snapshots.find(handle);
+    return it == m_process_snapshots.end() ? nullptr : &it->second;
+}
+
+bool c_emulator_ctx::close_process_snapshot(const uint64_t handle) const {
+    return m_process_snapshots.erase(handle) != 0;
+}
+
+const s_hooked_function* c_emulator_ctx::get_hook(const uint64_t address) {
+    const auto hook = m_hooks.find(address);
+
+    if (hook == m_hooks.end()) {
+        return nullptr;
+    }
+
+    return &hook->second;
+}
+
+uint64_t c_emulator_ctx::map_dummy_module(const std::vector<uint8_t> &image, const std::string &name) const {
+    const auto image_base = m_memory_manager->allocate_helper_stub(static_cast<uint32_t>(image.size()));
+
+    auto err = uc_mem_map(m_uc, image_base, page_up(image.size(), 0x1000), UC_PROT_READ);
+
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("emulator ctx: failed to map dummy module: " + std::to_string(err));
+    }
+
+    err = uc_mem_write(m_uc, image_base, image.data(), image.size());
+
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("emulator ctx: failed to write dummy module: " + std::to_string(err));
+    }
+
+    m_memory_manager->tag_region(image_base, name);
+    return image_base;
+}
+
+uc_err c_emulator_ctx::emulate(uint64_t start, const uint64_t end, const size_t count) const {
+    for (;;) {
+        m_hook_resume.reset();
+        const auto err = uc_emu_start(m_uc, start, end, 0, count);
+        if (!m_hook_resume || (err != UC_ERR_OK && err != UC_ERR_FETCH_PROT)) {
+            return err;
+        }
+
+        start = *m_hook_resume;
+        set_pc(start);
+        if (count == 1 || (end && start == end)) {
+            return UC_ERR_OK;
+        }
+    }
+}
+
+void c_emulator_ctx::single_step(std::function<mem_callback_t> on_mem) const {
+    uc_hook mem_trace;
+
+    if (on_mem) {
+        uc_hook_add(m_uc, &mem_trace, UC_HOOK_MEM_READ | UC_HOOK_MEM_READ_UNMAPPED |
+            UC_HOOK_MEM_READ_PROT | UC_HOOK_MEM_WRITE | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_WRITE_PROT,
+            reinterpret_cast<void*>(mem_callback), reinterpret_cast<void*>(&on_mem), 1, 0);
+    }
+
+    uc_ctl_remove_cache(m_uc, 0, UINT64_MAX);
+    uc_ctl_flush_tb(m_uc);
+
+    if (const auto err = emulate(get_pc(), 0, 1); err != UC_ERR_OK) {
+        throw std::runtime_error("emulator ctx: failed to start single step emulation: " +
+            std::to_string(err));
+    }
+
+    if (on_mem) {
+        uc_hook_del(m_uc, mem_trace);
+    }
+}
+
+void c_emulator_ctx::run(const uint64_t start, const uint64_t end, std::function<code_callback_t> on_code,
+    std::function<mem_callback_t> on_mem) const {
+    //
+    uc_hook code_trace, mem_trace;
+    auto err = UC_ERR_OK;
+
+    // if code callback function was provided, set up single step hook
+    if (on_code) {
+        err = uc_hook_add(m_uc, &code_trace, UC_HOOK_CODE, reinterpret_cast<void*>(code_callback),
+            reinterpret_cast<void*>(&on_code), 1, 0);
+
+        if (err != UC_ERR_OK) {
+            throw std::runtime_error("emulator ctx: failed to place code hook: " +
+                std::to_string(err));
+        }
+    }
+
+    // if memory callback function was provided, set up single step hook
+    if (on_mem) {
+        err = uc_hook_add(m_uc, &mem_trace, UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, reinterpret_cast<void*>(mem_callback),
+            on_mem ? reinterpret_cast<void*>(&on_mem) : nullptr, 1, 0);
+
+        if (err != UC_ERR_OK) {
+            throw std::runtime_error("emulator ctx: failed to place mem hook: " +
+                std::to_string(err));
+        }
+    }
+
+    uc_ctl_remove_cache(m_uc, 0, UINT64_MAX);
+    uc_ctl_flush_tb(m_uc);
+
+    err = emulate(start, end, 0);
+
+    if (err != UC_ERR_OK && err != UC_ERR_FETCH_PROT) {
+        /*
+        printf("failed at 0x%llX , rsi - 0x%llX , rdi - 0x%llX , rax - 0x%llX , rbx - 0x%llX , r10 - 0x%llX, rbp - 0x%llX, r15 - 0x%llX, rcx - 0x%llX, r12 - 0x%llX\n",
+            get_pc(),
+            get_x86_reg_value(UC_X86_REG_RSI), get_x86_reg_value(UC_X86_REG_RDI), get_x86_reg_value(UC_X86_REG_RAX),
+            get_x86_reg_value(UC_X86_REG_RBX), get_x86_reg_value(UC_X86_REG_R10), get_x86_reg_value(UC_X86_REG_RBP),
+            get_x86_reg_value(UC_X86_REG_R15), get_x86_reg_value(UC_X86_REG_RCX), get_x86_reg_value(UC_X86_REG_R12));
+        */
+
+        throw std::runtime_error("emulation error: " + std::to_string(err));
+    }
+
+    // remove callbacks
+    if (on_code) {
+        uc_hook_del(m_uc, code_trace);
+    }
+
+    if (on_mem) {
+        uc_hook_del(m_uc, mem_trace);
+    }
+}
+
+uint64_t c_emulator_ctx::get_pc() const {
+    if (get_arch() == e_architecture::k_x86) {
+        return get_x86_reg_value(UC_X86_REG_EIP);
+    }
+
+    switch (m_emulator->get_arch()) {
+        case e_architecture::k_amd64: {
+            uint64_t rip;
+            uc_reg_read(m_uc, UC_X86_REG_RIP, &rip);
+
+            return rip;
+        }
+
+        default:
+            throw std::runtime_error("emulator ctx: unsupported architecture " +
+                std::to_string(static_cast<int>(m_emulator->get_arch())));
+    }
+}
+
+void c_emulator_ctx::set_pc(const uint64_t new_pc) const {
+    if (get_arch() == e_architecture::k_x86) {
+        set_x86_reg_value(UC_X86_REG_EIP, new_pc);
+        return;
+    }
+
+    switch (m_emulator->get_arch()) {
+        case e_architecture::k_amd64: {
+            uc_reg_write(m_uc, UC_X86_REG_RIP, &new_pc);
+            break;
+        }
+
+        default:
+            throw std::runtime_error("emulator ctx: unsupported architecture");
+    }
+}
+
+uint64_t c_emulator_ctx::allocate_storage(const uint32_t size, const std::string &tag) const {
+    const auto region_base = m_memory_manager->allocate_helper_stub(size);
+    const auto aligned_size = page_up(size, 0x1000);
+
+    if (const auto err = uc_mem_map(m_uc, region_base, aligned_size, UC_PROT_ALL); err != UC_ERR_OK) {
+        //
+        throw std::runtime_error("emulator ctx: failed to allocate region: " + std::to_string(err));
+    }
+
+    const std::vector<uint8_t> region_dump(aligned_size, 0);
+    uc_mem_write(m_uc, region_base, region_dump.data(), region_dump.size());
+
+    if (!tag.empty()) {
+        std::stringstream tag_with_addr_stream;
+        tag_with_addr_stream << tag;
+        tag_with_addr_stream << "_0x" << std::hex << region_base;
+
+        m_memory_manager->tag_region(region_base, tag_with_addr_stream.str());
+    }
+
+    return region_base;
+}
+
+void c_emulator_ctx::initialize_windows_ldr() const {
+    const auto is_x86 = get_arch() == e_architecture::k_x86;
+    const uint32_t ptr_size = is_x86 ? 4 : 8;
+
+    if (get_arch() != e_architecture::k_amd64 && get_arch() != e_architecture::k_x86) {
+        throw std::runtime_error("unsupported architecture");
+    }
+
+    auto *uc = m_uc;
+
+    const auto read_ptr = [&](uint64_t address) -> uint64_t {
+        uint64_t value = 0;
+
+        if (uc_mem_read(uc, address, &value, ptr_size) != UC_ERR_OK) {
+            throw std::runtime_error("failed to read Windows loader memory");
+        }
+
+        return value;
+    };
+
+    const auto write = [&](uint64_t address, const void *data, size_t size) {
+        if (uc_mem_write(uc, address, data, size) != UC_ERR_OK) {
+            throw std::runtime_error("failed to write Windows loader memory");
+        }
+    };
+
+    const auto write32 = [&](uint64_t address, uint32_t value) {
+        write(address, &value, sizeof(value));
+    };
+
+    const auto write_ptr = [&](uint64_t address, uint64_t value) {
+        write(address, &value, ptr_size);
+    };
+
+    uc_x86_msr msr{};
+    msr.rid = static_cast<uint32_t>(unthemidator::windows::e_msr::k_ia32_gs_base);
+
+    if (!is_x86 && uc_reg_read(uc, UC_X86_REG_MSR, &msr) != UC_ERR_OK) {
+        throw std::runtime_error("failed to read GS base");
+    }
+
+    const uint64_t teb_base = is_x86 ? m_memory_manager->get_address_by_tag("TEB").value() : msr.value;
+    const uint64_t peb_base = read_ptr(teb_base + (is_x86 ? 0x30 : 0x60));
+    const uint64_t ldr_base = read_ptr(peb_base + (is_x86 ? 0x0C : 0x18));
+
+    if (!teb_base || !peb_base || !ldr_base) {
+        throw std::runtime_error("Windows loader environment is not initialized");
+    }
+
+    const uint64_t ntdll_base = m_imports->load_module("ntdll.dll");
+
+    if (!ntdll_base) {
+        throw std::runtime_error("failed to load ntdll.dll");
+    }
+
+    // Extract image metadata from the mapped ntdll.dll.
+    uint16_t dos_magic = 0;
+    uint32_t nt_offset = 0;
+    uint32_t nt_signature = 0;
+    uint16_t optional_magic = 0;
+    uint32_t entry_rva = 0;
+    uint32_t image_size = 0;
+
+    const auto read = [&](uint64_t address, void *data, size_t size) {
+        if (uc_mem_read(uc, address, data, size) != UC_ERR_OK) {
+            throw std::runtime_error("failed to read ntdll.dll headers");
+        }
+    };
+
+    read(ntdll_base, &dos_magic, sizeof(dos_magic));
+    read(ntdll_base + 0x3C, &nt_offset, sizeof(nt_offset));
+
+    if (dos_magic != 0x5A4D || nt_offset > 0x1000 - 0x60) {
+        throw std::runtime_error("invalid ntdll.dll DOS header");
+    }
+
+    const uint64_t nt_header = ntdll_base + nt_offset;
+    const uint64_t optional_header = nt_header + 4 + 20;
+
+    read(nt_header, &nt_signature, sizeof(nt_signature));
+    read(optional_header, &optional_magic, sizeof(optional_magic));
+
+    if (nt_signature != 0x00004550 || optional_magic != (is_x86 ? 0x10B : 0x20B)) {
+        throw std::runtime_error("invalid ntdll.dll PE32+ headers");
+    }
+
+    read(optional_header + 0x10, &entry_rva, sizeof(entry_rva));
+    read(optional_header + 0x38, &image_size, sizeof(image_size));
+
+    if (!image_size || entry_rva >= image_size ||
+        ntdll_base > std::numeric_limits<uint64_t>::max() - image_size) {
+        throw std::runtime_error("invalid ntdll.dll image metadata");
+    }
+
+    constexpr uint64_t k_page_size = 0x1000;
+    constexpr uint64_t k_full_name_offset = 0x100;
+    constexpr uint64_t k_base_name_offset = 0x180;
+
+    constexpr char16_t k_full_name[] = u"C:\\Windows\\System32\\ntdll.dll";
+    constexpr char16_t k_base_name[] = u"ntdll.dll";
+
+    const uint64_t entry_base = m_memory_manager->allocate_helper_stub(k_page_size);
+
+    if (!entry_base || entry_base > std::numeric_limits<uint64_t>::max() - k_page_size) {
+        throw std::runtime_error("invalid LDR entry address");
+    }
+
+    std::array<uint8_t, k_page_size> entry{};
+
+    const auto set16 = [&](size_t offset, uint16_t value) {
+        std::memcpy(entry.data() + offset, &value, sizeof(value));
+    };
+
+    const auto set32 = [&](size_t offset, uint32_t value) {
+        std::memcpy(entry.data() + offset, &value, sizeof(value));
+    };
+
+    const auto set_ptr = [&](size_t offset, uint64_t value) {
+        std::memcpy(entry.data() + offset, &value, ptr_size);
+    };
+
+    const auto set_unicode_string = [&](size_t offset, uint64_t string_offset,
+        const char16_t *value, size_t byte_size) {
+        //
+        const auto length = static_cast<uint16_t>(byte_size - sizeof(char16_t));
+        const auto maximum_length = static_cast<uint16_t>(byte_size);
+
+        set16(offset, length);
+        set16(offset + 2, maximum_length);
+        set_ptr(offset + ptr_size, entry_base + string_offset);
+
+        std::memcpy(entry.data() + string_offset, value, byte_size);
+    };
+
+    // LDR_DATA_TABLE_ENTRY: list links
+    const std::array<uint64_t, 3> k_entry_list_offsets = { 0, 2ULL * ptr_size, 4ULL * ptr_size };
+    const std::array k_ldr_list_offsets = { 8ULL + ptr_size, 8ULL + 3 * ptr_size, 8ULL + 5 * ptr_size };
+
+    for (size_t i = 0; i < k_entry_list_offsets.size(); ++i) {
+        const uint64_t head = ldr_base + k_ldr_list_offsets[i];
+        const uint64_t node = entry_base + k_entry_list_offsets[i];
+
+        // LIST_ENTRY.Flink / LIST_ENTRY.Blink.
+        set_ptr(k_entry_list_offsets[i], head);
+        set_ptr(k_entry_list_offsets[i] + ptr_size, head);
+    }
+
+    set_ptr(is_x86 ? 0x18 : 0x30, ntdll_base);
+    set_ptr(is_x86 ? 0x1C : 0x38, entry_rva ? ntdll_base + entry_rva : 0);
+    set32(is_x86 ? 0x20 : 0x40, image_size);
+
+    set_unicode_string(is_x86 ? 0x24 : 0x48, k_full_name_offset,
+        k_full_name, sizeof(k_full_name));
+
+    set_unicode_string(is_x86 ? 0x2C : 0x58, k_base_name_offset,
+        k_base_name, sizeof(k_base_name));
+
+    // Map and populate LDR_DATA_TABLE_ENTRY and both Unicode strings.
+    if (uc_mem_map(uc, entry_base, k_page_size, UC_PROT_READ | UC_PROT_WRITE) != UC_ERR_OK) {
+        throw std::runtime_error("failed to map LDR entry");
+    }
+
+    write(entry_base, entry.data(), entry.size());
+
+    // Initialize PEB_LDR_DATA fields.
+    write32(ldr_base + 0x00, is_x86 ? 0x30 : 0x58);
+
+    constexpr uint8_t initialized = 1;
+    write(ldr_base + 0x04, &initialized, sizeof(initialized));
+
+    // Link all three lists to the single entry.
+    for (size_t i = 0; i < k_ldr_list_offsets.size(); ++i) {
+        const uint64_t head = ldr_base + k_ldr_list_offsets[i];
+        const uint64_t node = entry_base + k_entry_list_offsets[i];
+
+        write_ptr(head, node);
+        write_ptr(head + ptr_size, node);
+    }
+}

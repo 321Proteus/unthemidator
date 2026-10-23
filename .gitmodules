@@ -1,0 +1,6 @@
+[submodule "dependencies/unicorn"]
+	path = dependencies/unicorn
+	url = https://github.com/unicorn-engine/unicorn.git
+[submodule "dependencies/zydis"]
+	path = dependencies/zydis
+	url = https://github.com/zyantific/zydis.git
