@@ -13,8 +13,6 @@ struct c_intel_instruction {
     ZydisDecodedInstruction m_instruction = {};
     std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> m_operands = {};
 
-    std::vector<uint8_t> m_raw_bytes;
-
     uint64_t m_branch_target = 0;
 };
 

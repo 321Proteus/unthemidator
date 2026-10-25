@@ -1,7 +1,6 @@
 #include "c_intel_disassembler.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <iterator>
 
 // zero-filled memory decodes as an endless "add [rax], al", so this many zero bytes end a block
@@ -31,7 +30,6 @@ std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32
     s_walk_ctx ctx{
         .function = fn.get(),
         .rva_to_bb_index = {},
-        .rva_to_instr_bb_index = {},
         .pending = {},
     };
 
@@ -149,11 +147,7 @@ c_intel_instruction c_intel_disassembler::disassemble_instruction(uint32_t rva) 
         throw std::runtime_error("ZydisDecoderDecodeFull() failed: "+ std::to_string(last_status));
     }
 
-    std::vector<uint8_t> raw_bytes{};
-    raw_bytes.resize(instruction.length);
-    std::memcpy(raw_bytes.data(), mapped_image.data() + rva, raw_bytes.size());
-
-    return c_intel_instruction(rva, instruction, operands, raw_bytes);
+    return c_intel_instruction(rva, instruction, operands);
 }
 
 std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_walk_ctx &ctx) {
@@ -162,8 +156,8 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
     }
 
     // target lands inside a block aready decoded so we split it
-    if (const auto it = ctx.rva_to_instr_bb_index.find(rva); it != ctx.rva_to_instr_bb_index.end()) {
-        return split_basic_block(it->second, rva, ctx);
+    if (const auto owner = find_block_containing(rva, ctx)) {
+        return split_basic_block(*owner, rva, ctx);
     }
 
     const auto &mapped_image = m_memory->get_mapped_image();
@@ -180,8 +174,8 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
 
     while (true) {
         //Already decoded - end the block and fall through
-        if (const auto it = ctx.rva_to_instr_bb_index.find(cursor); cursor != rva && it != ctx.rva_to_instr_bb_index.end()) {
-            split_basic_block(it->second, cursor, ctx);
+        if (const auto owner = cursor != rva ? find_block_containing(cursor, ctx) : std::nullopt) {
+            split_basic_block(*owner, cursor, ctx);
             break;
         }
 
@@ -206,17 +200,12 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             return std::nullopt;
         }
 
-        std::vector<uint8_t> raw_bytes(decoded.length);
-        std::memcpy(raw_bytes.data(), mapped_image.data() + cursor, decoded.length);
-
         c_intel_instruction instr;
         instr.m_rva = cursor;
         instr.m_instruction = decoded;
         instr.m_operands = operands;
-        instr.m_raw_bytes = std::move(raw_bytes);
         instr.m_branch_target = 0;
 
-        ctx.rva_to_instr_bb_index[cursor] = block_index;
         bb.m_end_rva = cursor + decoded.length;
 
         const auto category = decoded.meta.category;
@@ -289,6 +278,24 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
     return block_index;
 }
 
+std::optional<size_t> c_intel_disassembler::find_block_containing(const uint32_t rva, const s_walk_ctx &ctx) {
+    // blocks never overlap on instruction boundaries, so only the closest block starting at or before rva can contain it
+    auto it = ctx.rva_to_bb_index.upper_bound(rva);
+
+    if (it == ctx.rva_to_bb_index.begin()) {
+        return std::nullopt;
+    }
+
+    const auto &block = ctx.function->m_basic_blocks[(--it)->second];
+
+    if (rva >= block.m_end_rva ||
+        !std::ranges::binary_search(block.m_instructions, rva, {}, &c_intel_instruction::m_rva)) {
+        return std::nullopt;
+    }
+
+    return it->second;
+}
+
 size_t c_intel_disassembler::split_basic_block(const size_t block_index, const uint32_t rva, s_walk_ctx &ctx) {
     if (const auto it = ctx.rva_to_bb_index.find(rva); it != ctx.rva_to_bb_index.end()) {
         return it->second;
@@ -311,10 +318,6 @@ size_t c_intel_disassembler::split_basic_block(const size_t block_index, const u
 
     const size_t tail_index = blocks.size();
     ctx.rva_to_bb_index[rva] = tail_index;
-
-    for (const auto &instr : tail.m_instructions) {
-        ctx.rva_to_instr_bb_index[instr.m_rva] = tail_index;
-    }
 
     blocks.push_back(std::move(tail));
     return tail_index;

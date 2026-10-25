@@ -6,8 +6,8 @@
 #include "c_intel_function.hpp"
 #include "../memory/c_memory_manager.hpp"
 
+#include <map>
 #include <optional>
-#include <unordered_map>
 #include <Zydis/Decoder.h>
 
 class c_intel_disassembler final {
@@ -20,12 +20,12 @@ public:
 private:
     struct s_walk_ctx {
         c_intel_function *function;
-        std::unordered_map<uint32_t, size_t> rva_to_bb_index;
-        std::unordered_map<uint32_t, size_t> rva_to_instr_bb_index;
+        std::map<uint32_t, size_t> rva_to_bb_index;
         std::vector<uint32_t> pending;
     };
 
     std::optional<size_t> walk_basic_block(uint32_t rva, s_walk_ctx &ctx);
+    static std::optional<size_t> find_block_containing(uint32_t rva, const s_walk_ctx &ctx);
     static size_t split_basic_block(size_t block_index, uint32_t rva, s_walk_ctx &ctx);
     static void add_edge(size_t from_index, size_t to_index, c_intel_function &fn);
 
