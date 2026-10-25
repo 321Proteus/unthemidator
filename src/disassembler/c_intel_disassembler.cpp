@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
+
+// zero-filled memory decodes as an endless "add [rax], al", so this many zero bytes end a block
+constexpr size_t K_MAX_ZEROS = 8;
 
 c_intel_disassembler::c_intel_disassembler(const std::shared_ptr<c_memory>& memory, const bool is_x64) : m_memory(memory) {
     //
@@ -27,6 +31,7 @@ std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32
     s_walk_ctx ctx{
         .function = fn.get(),
         .rva_to_bb_index = {},
+        .rva_to_instr_bb_index = {},
         .pending = {},
     };
 
@@ -156,6 +161,11 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
         return it->second;
     }
 
+    // target lands inside a block aready decoded so we split it
+    if (const auto it = ctx.rva_to_instr_bb_index.find(rva); it != ctx.rva_to_instr_bb_index.end()) {
+        return split_basic_block(it->second, rva, ctx);
+    }
+
     const auto &mapped_image = m_memory->get_mapped_image();
 
     const size_t block_index = ctx.function->m_basic_blocks.size();
@@ -169,9 +179,20 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
     uint32_t cursor = rva;
 
     while (true) {
+        //Already decoded - end the block and fall through
+        if (const auto it = ctx.rva_to_instr_bb_index.find(cursor); cursor != rva && it != ctx.rva_to_instr_bb_index.end()) {
+            split_basic_block(it->second, cursor, ctx);
+            break;
+        }
+
         auto &bb = ctx.function->m_basic_blocks[block_index];
 
         if (cursor + ZYDIS_MAX_INSTRUCTION_LENGTH > mapped_image.size()) {
+            break;
+        }
+
+        if (std::all_of(mapped_image.begin() + cursor, mapped_image.begin() + cursor + K_MAX_ZEROS,
+            [](const uint8_t byte) { return byte == 0; })) {
             break;
         }
 
@@ -195,6 +216,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
         instr.m_raw_bytes = std::move(raw_bytes);
         instr.m_branch_target = 0;
 
+        ctx.rva_to_instr_bb_index[cursor] = block_index;
         bb.m_end_rva = cursor + decoded.length;
 
         const auto category = decoded.meta.category;
@@ -258,8 +280,44 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
         bb.m_instructions.push_back(std::move(instr));
         cursor += decoded.length;
     }
+    if (const auto &b = ctx.function->m_basic_blocks[block_index]; b.m_instructions.size() > 100000) {
+        printf("huge block: fn=0x%x block=0x%x-0x%x instrs=%zu first=%s\n",
+            ctx.function->m_start_rva, b.m_start_rva, b.m_end_rva, b.m_instructions.size(),
+            ZydisMnemonicGetString(b.m_instructions.front().m_instruction.mnemonic));
+    }
 
     return block_index;
+}
+
+size_t c_intel_disassembler::split_basic_block(const size_t block_index, const uint32_t rva, s_walk_ctx &ctx) {
+    if (const auto it = ctx.rva_to_bb_index.find(rva); it != ctx.rva_to_bb_index.end()) {
+        return it->second;
+    }
+
+    auto &blocks = ctx.function->m_basic_blocks;
+    auto &instructions = blocks[block_index].m_instructions;
+
+    const auto split_it = std::ranges::lower_bound(instructions, rva, {}, &c_intel_instruction::m_rva);
+
+    c_intel_basic_block tail;
+    tail.m_start_rva = rva;
+    tail.m_end_rva = blocks[block_index].m_end_rva;
+    tail.m_is_final = blocks[block_index].m_is_final;
+    tail.m_instructions.assign(std::make_move_iterator(split_it), std::make_move_iterator(instructions.end()));
+
+    instructions.erase(split_it, instructions.end());
+    blocks[block_index].m_end_rva = rva;
+    blocks[block_index].m_is_final = false;
+
+    const size_t tail_index = blocks.size();
+    ctx.rva_to_bb_index[rva] = tail_index;
+
+    for (const auto &instr : tail.m_instructions) {
+        ctx.rva_to_instr_bb_index[instr.m_rva] = tail_index;
+    }
+
+    blocks.push_back(std::move(tail));
+    return tail_index;
 }
 
 void c_intel_disassembler::add_edge(const size_t from_index, const size_t to_index, c_intel_function &fn) {
