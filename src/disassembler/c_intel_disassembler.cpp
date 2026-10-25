@@ -1,7 +1,6 @@
 #include "c_intel_disassembler.hpp"
 
 #include <algorithm>
-#include <iterator>
 
 // zero-filled memory decodes as an endless "add [rax], al", so this many zero bytes end a block
 constexpr size_t K_MAX_ZEROS = 8;
@@ -219,7 +218,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
                 bb.m_end_rva = cursor;
             }
 
-            bb.m_instructions.push_back(std::move(instr));
+            bb.m_instructions.push_back(instr);
             break;
         }
 
@@ -227,7 +226,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 // indirect jump , treat as function exit.
                 bb.m_is_final = true;
-                bb.m_instructions.push_back(std::move(instr));
+                bb.m_instructions.push_back(instr);
                 break;
             }
 
@@ -237,7 +236,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             }
 
             instr.m_branch_target = target;
-            bb.m_instructions.push_back(std::move(instr));
+            bb.m_instructions.push_back(instr);
 
             ctx.pending.push_back(static_cast<uint32_t>(target));
             break;
@@ -257,7 +256,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             const uint32_t fallthrough = cursor + decoded.length;
 
             instr.m_branch_target = target;
-            bb.m_instructions.push_back(std::move(instr));
+            bb.m_instructions.push_back(instr);
 
             // pushed in reverse so the target is walked first
             ctx.pending.push_back(fallthrough);
@@ -266,7 +265,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
         }
 
         // ordinary instruction — extend the block and continue.
-        bb.m_instructions.push_back(std::move(instr));
+        bb.m_instructions.push_back(instr);
         cursor += decoded.length;
     }
     if (const auto &b = ctx.function->m_basic_blocks[block_index]; b.m_instructions.size() > 100000) {
@@ -310,7 +309,7 @@ size_t c_intel_disassembler::split_basic_block(const size_t block_index, const u
     tail.m_start_rva = rva;
     tail.m_end_rva = blocks[block_index].m_end_rva;
     tail.m_is_final = blocks[block_index].m_is_final;
-    tail.m_instructions.assign(std::make_move_iterator(split_it), std::make_move_iterator(instructions.end()));
+    tail.m_instructions.assign(split_it, instructions.end());
 
     instructions.erase(split_it, instructions.end());
     blocks[block_index].m_end_rva = rva;
