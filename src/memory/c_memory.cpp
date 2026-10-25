@@ -38,7 +38,7 @@ c_memory::c_memory(const std::shared_ptr<c_pe_image>& pe_image) : m_pe_image(pe_
     m_commited_memory_start = m_cursor;
 }
 
-std::vector<uint8_t> c_memory::get_mapped_image() const {
+const std::vector<uint8_t>& c_memory::get_mapped_image() const {
     return m_mapped_image;
 }
 

@@ -36,7 +36,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<c_memory> get_memory() const;
     [[nodiscard]] std::shared_ptr<c_imports> get_imports() const;
-    [[nodiscard]] std::vector<uint8_t> get_original_file_mapping() const;
+    [[nodiscard]] const std::vector<uint8_t>& get_original_file_mapping() const;
 
     void set_themida_unpacker(c_themida_unpacker* unpacker);
     [[nodiscard]] c_themida_unpacker* get_themida_unpacker() const;

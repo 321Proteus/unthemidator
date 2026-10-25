@@ -189,7 +189,7 @@ c_themida_unpacker * c_emulator_ctx::get_themida_unpacker() const {
     return m_themida_unpacker;
 }
 
-std::vector<uint8_t> c_emulator_ctx::get_original_file_mapping() const {
+const std::vector<uint8_t>& c_emulator_ctx::get_original_file_mapping() const {
     return m_memory_manager->get_pe_image()->get_original_mapping();
 }
 

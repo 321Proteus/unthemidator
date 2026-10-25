@@ -18,7 +18,7 @@ class c_memory {
 public:
     explicit c_memory(const std::shared_ptr<c_pe_image>& pe_image);
 
-    [[nodiscard]] std::vector<uint8_t> get_mapped_image() const;
+    [[nodiscard]] const std::vector<uint8_t>& get_mapped_image() const;
     [[nodiscard]] std::shared_ptr<c_pe_image> get_pe_image() const;
 
     [[nodiscard]] uint64_t get_image_base() const;
