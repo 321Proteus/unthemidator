@@ -2,8 +2,6 @@
 
 #include <algorithm>
 
-// zero-filled memory decodes as an endless "add [rax], al", so this many zero bytes end a block
-constexpr size_t K_MAX_ZEROS = 8;
 
 c_intel_disassembler::c_intel_disassembler(const std::shared_ptr<c_memory>& memory, const bool is_x64) : m_memory(memory) {
     //

@@ -226,8 +226,13 @@ void c_themida_unpacker::decompress_vms() {
 
     std::unordered_set<uint64_t> vm_enters{};
 
+    size_t processed = 0;
+
     // iterate over all trampolines and decompress unique vm enters
     for (const auto &vm_trampoline: m_vm_trampolines) {
+        std::cout << "\r[unthemidator][vm decompressor] processing trampoline " << ++processed << "/"
+            << m_vm_trampolines.size() << std::flush;
+
         if (!vm_trampoline.m_is_packed) {
             continue;
         }
@@ -238,6 +243,8 @@ void c_themida_unpacker::decompress_vms() {
 
         run_decompression_stub(vm_trampoline);
     }
+
+    std::cout << std::endl;
 
     const auto end = std::chrono::high_resolution_clock::now();
     const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -605,11 +612,19 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
 
     const auto region_end = base_address + region.size();
 
+    // count candidates first so the progress output can show X/Y
+    const auto candidate_count = std::count_if(region.begin(), region.end() - 4, [](const uint8_t byte) {
+        return byte == 0xE8 || byte == 0xE9;
+    });
+    long candidate = 0;
+
     // find all JMP/CALL instructions in the region and check if they're the jumps to VM
     for (size_t i = 0; i < region.size() - 4; i++) {
         if (region.at(i) != 0xE8 && region.at(i) != 0xE9) {
             continue;
         }
+
+        ++candidate;
 
         auto rva = *reinterpret_cast<const int32_t *>(region.data() + i + 1);
         auto target_va = static_cast<uint64_t>(rva + static_cast<int64_t>(base_address + i + 5));
@@ -635,6 +650,10 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
             continue;
         }
 
+        std::cout << "\r[unthemidator][vm] scanning 0x" << std::hex << base_address << std::dec
+            << " for VM trampolines: candidate " << candidate << "/" << candidate_count << " (0x"
+            << std::hex << base_address + i << " -> 0x" << target_va << std::dec << ")\033[K" << std::flush;
+
         const auto disassembled = m_disassembler->disassemble(static_cast<uint32_t>(target_va - image_base));
 
         if (!disassembled) {
@@ -657,9 +676,17 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
         // track function progressively to find if it pushes flags onto the stack before modifying any
         // and then acquires the lock to classify it as vm entry
         std::optional next_bb_id = disassembled->m_first_bb_id;
+        std::unordered_set<size_t> checked_bbs{};
 
         while (next_bb_id.has_value()) {
             const auto &bb = disassembled->m_basic_blocks.at(next_bb_id.value());
+
+            // successor chains can loop (e.g. jmp $), stop once a block repeats
+            if (checked_bbs.contains(next_bb_id.value())) {
+                break;
+            }
+
+            checked_bbs.insert(next_bb_id.value());
 
             if (preserved_flags) {
                 break;
@@ -760,6 +787,9 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
             .m_dispatch_address = dispatch_address.value(),
         });
     }
+
+    std::cout << "\r[unthemidator][vm] scanning 0x" << std::hex << base_address << std::dec
+        << " for VM trampolines: done, " << candidate_count << " candidates\033[K" << std::endl;
 }
 
 bool c_themida_unpacker::recover_import(const uint64_t entry_address) {

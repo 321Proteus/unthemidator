@@ -12,6 +12,9 @@
 
 class c_intel_disassembler final {
 public:
+    // zero-filled memory decodes as an endless "add [rax], al", so this many zero bytes end a block
+    static constexpr size_t K_MAX_ZEROS = 8;
+
     explicit c_intel_disassembler(const std::shared_ptr<c_memory>& memory, bool is_x64 = true);
 
     std::shared_ptr<c_intel_function> disassemble(uint32_t rva);
