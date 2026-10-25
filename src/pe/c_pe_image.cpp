@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <cstring>
 
 #include "pe_structs.hpp"
 
@@ -89,7 +90,7 @@ void c_pe_image::parse() {
         m_is_x64 = false;
 
         // copy image headers
-        memcpy(m_mapped_binary.data(), m_file_binary.data(), opt_header->size_of_headers);
+        std::memcpy(m_mapped_binary.data(), m_file_binary.data(), opt_header->size_of_headers);
     } else if (opt_magic == k_optional_magic_pe32_plus) {
         const auto opt_header = reinterpret_cast<s_optional_header_64 *>(m_file_binary.data() + m_opt_header_offset);
 
@@ -101,7 +102,7 @@ void c_pe_image::parse() {
         m_is_x64 = true;
 
         // copy image headers
-        memcpy(m_mapped_binary.data(), m_file_binary.data(), opt_header->size_of_headers);
+        std::memcpy(m_mapped_binary.data(), m_file_binary.data(), opt_header->size_of_headers);
     } else {
         throw std::runtime_error("PE error: invalid magic number in optional header");
     }
@@ -128,7 +129,7 @@ void c_pe_image::parse() {
         });
 
         // copy section to mapped binary
-        memcpy(m_mapped_binary.data() + section->virtual_address, m_file_binary.data() +
+        std::memcpy(m_mapped_binary.data() + section->virtual_address, m_file_binary.data() +
             section->pointer_to_raw_data, section->size_of_raw_data);
     }
 

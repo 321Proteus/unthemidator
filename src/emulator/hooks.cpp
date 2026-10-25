@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cstring>
 
 #include "../unpacker/c_themida_unpacker.hpp"
 
@@ -199,7 +200,7 @@ void hooks::get_current_dir(const c_emulator_ctx *ctx) {
 }
 
 void hooks::get_module_filename(const c_emulator_ctx *ctx) {
-    constexpr auto path = std::wstring(L"\\C:\\");
+    const auto path = std::wstring(L"\\C:\\");
 
     const auto buff_ptr = ctx->get_arg(1);
     uc_mem_write(ctx->get_uc(), buff_ptr, path.data(), path.length() * sizeof(wchar_t));
@@ -210,7 +211,7 @@ void hooks::get_module_filename(const c_emulator_ctx *ctx) {
 void hooks::get_command_line_a(const c_emulator_ctx *ctx) {
     const auto str_location = ctx->allocate_storage(0x100);
 
-    constexpr std::string command_line = R"("C:\bebra.exe")";
+    static constexpr std::string command_line = R"("C:\bebra.exe")";
     uc_mem_write(ctx->get_uc(), str_location, command_line.data(), command_line.length());
 
     ctx->set_result(str_location);
@@ -509,7 +510,7 @@ void hooks::nt_query_system_information(const c_emulator_ctx *ctx) {
             module.load_count = 1;
             module.offset_to_file_name = sizeof(module_path) - sizeof(module_name);
 
-            memcpy(module.full_path_name, module_path, sizeof(module_path));
+            std::memcpy(module.full_path_name, module_path, sizeof(module_path));
 
             constexpr uint32_t required_length = sizeof(info);
 

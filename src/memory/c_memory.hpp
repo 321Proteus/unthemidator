@@ -6,6 +6,7 @@
 #include <optional>
 #include <memory>
 #include <string>
+#include <cstdint>
 
 class c_pe_image;
 

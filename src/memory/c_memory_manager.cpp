@@ -1,5 +1,6 @@
 #include "c_memory_manager.hpp"
 
+#include <cstring>
 #include <stdexcept>
 
 #include "../pe/c_pe_image.hpp"
@@ -34,12 +35,12 @@ void c_memory_manager::write_memory(const uint64_t address, const std::vector<ui
             throw std::runtime_error("memory: attempted out of range write");
         }
 
-        memcpy(m_mapped_image.data() + address - m_image_base, dump.data(), dump.size());
+        std::memcpy(m_mapped_image.data() + address - m_image_base, dump.data(), dump.size());
         return;
     }
 
     if (address >= m_commited_memory_start) {
-        memcpy(m_commited_memory.data() + address - m_commited_memory_start, dump.data(), dump.size());
+        std::memcpy(m_commited_memory.data() + address - m_commited_memory_start, dump.data(), dump.size());
         return;
     }
 

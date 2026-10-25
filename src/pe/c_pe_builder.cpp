@@ -22,7 +22,7 @@ namespace {
         }
 
         T value{};
-        memcpy(&value, data.data() + offset, sizeof(T));
+        std::memcpy(&value, data.data() + offset, sizeof(T));
         return value;
     }
 
@@ -32,7 +32,7 @@ namespace {
             throw std::runtime_error("pe builder: invalid write offset");
         }
 
-        memcpy(data.data() + offset, &value, sizeof(T));
+        std::memcpy(data.data() + offset, &value, sizeof(T));
     }
 
     uint32_t align_up(const uint64_t value, const uint32_t alignment) {
@@ -107,7 +107,7 @@ void c_pe_builder::build() {
     }
 
     m_built_file = std::vector<uint8_t>(headers_size, 0);
-    memcpy(m_built_file.data(), mapped_image.data(), headers_size);
+    std::memcpy(m_built_file.data(), mapped_image.data(), headers_size);
 
     switch (read_at<uint16_t>(mapped_image, optional_offset)) {
         case k_optional_magic_pe32: {
@@ -240,10 +240,10 @@ void c_pe_builder::rename_sections() {
                 continue;
             }
 
-            constexpr std::string old_idata = ".old";
+            static constexpr std::string old_idata = ".old";
 
             memset(section.name, 0, sizeof(section.name));
-            memcpy(section.name, old_idata.c_str(), old_idata.length());
+            std::memcpy(section.name, old_idata.c_str(), old_idata.length());
 
             write_at(output, offset, section);
         }
@@ -280,7 +280,7 @@ void c_pe_builder::rename_sections() {
         auto section = read_at<s_section_header>(output, matching_offset);
 
         memset(section.name, 0, sizeof(section.name));
-        memcpy(section.name, name, std::strlen(name));
+        std::memcpy(section.name, name, std::strlen(name));
 
         write_at(output, matching_offset, section);
     }
@@ -448,7 +448,7 @@ void c_pe_builder::build_import_descriptor() {
         idata.resize(offset + size);
 
         if (size) {
-            memcpy(idata.data() + offset, data, size);
+            std::memcpy(idata.data() + offset, data, size);
         }
 
         return idata_rva + static_cast<uint32_t>(offset);
@@ -503,7 +503,7 @@ void c_pe_builder::build_import_descriptor() {
             const auto ilt_offset = static_cast<size_t>(descriptor.original_first_thunk - idata_rva) +
                 j * ptr_size;
 
-            memcpy(idata.data() + ilt_offset, &thunk_value, ptr_size);
+            std::memcpy(idata.data() + ilt_offset, &thunk_value, ptr_size);
 
             iat_writes.push_back({
                 .m_rva = entry.m_iat_rva,
@@ -511,7 +511,7 @@ void c_pe_builder::build_import_descriptor() {
             });
         }
 
-        memcpy(idata.data() + i * sizeof(s_import_descriptor), &descriptor, sizeof(descriptor));
+        std::memcpy(idata.data() + i * sizeof(s_import_descriptor), &descriptor, sizeof(descriptor));
     }
 
     add_section(".idata", idata, k_scn_cnt_initialized_data | k_scn_mem_read);
@@ -557,7 +557,7 @@ void c_pe_builder::build_tls() {
             throw std::runtime_error("pe builder: TLS address exceeds 32 bits");
         }
 
-        memcpy(tls.data() + offset, &value, ptr_size);
+        std::memcpy(tls.data() + offset, &value, ptr_size);
     };
 
     if (virtual_address) {
@@ -567,7 +567,7 @@ void c_pe_builder::build_tls() {
             throw std::runtime_error("pe builder: invalid existing TLS directory");
         }
 
-        memcpy(tls.data(), mapped.data() + virtual_address, directory_size);
+        std::memcpy(tls.data(), mapped.data() + virtual_address, directory_size);
 
         if (auto callback_array = read_pointer(tls, 3 * ptr_size)) {
             for (;;) {
@@ -759,7 +759,7 @@ void c_pe_builder::add_section(const std::string &name, const std::vector<uint8_
 
     s_section_header section{};
 
-    memcpy(section.name, name.data(), name.size());
+    std::memcpy(section.name, name.data(), name.size());
 
     section.virtual_address = section_rva;
     section.virtual_size = static_cast<uint32_t>(data.size());
@@ -768,7 +768,7 @@ void c_pe_builder::add_section(const std::string &name, const std::vector<uint8_
     section.characteristics = characteristics;
 
     m_built_file.resize(static_cast<size_t>(raw_offset) + raw_size, 0);
-    memcpy(m_built_file.data() + raw_offset, data.data(), data.size());
+    std::memcpy(m_built_file.data() + raw_offset, data.data(), data.size());
 
     write_at(m_built_file, header_offset, section);
 
@@ -823,7 +823,7 @@ void c_pe_builder::write_rva(const uint32_t rva, const void *data, const size_t 
             throw std::runtime_error("pe builder: invalid section raw data");
         }
 
-        memcpy(m_built_file.data() + file_offset, data, size);
+        std::memcpy(m_built_file.data() + file_offset, data, size);
         return;
     }
 

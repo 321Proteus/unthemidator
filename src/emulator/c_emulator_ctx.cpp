@@ -1,4 +1,5 @@
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <utility>
@@ -337,7 +338,7 @@ void c_emulator_ctx::raise_exception(const uint32_t exception_code) {
     std::array<uint8_t, k_context_size> context{};
 
     const auto write_field = [&](const size_t offset, const auto value) {
-        memcpy(context.data() + offset, &value, sizeof(value));
+        std::memcpy(context.data() + offset, &value, sizeof(value));
     };
 
     if (is_x86) {
@@ -432,14 +433,14 @@ void c_emulator_ctx::raise_exception(const uint32_t exception_code) {
 
             const auto apply = [&](const size_t offset, const uc_x86_reg reg) {
                 uint64_t value = 0;
-                memcpy(&value, context.data() + offset, sizeof(value));
+                std::memcpy(&value, context.data() + offset, sizeof(value));
                 set_x86_reg_value(reg, value);
             };
 
             if (is_x86) {
                 for (size_t i = 0; i < x86_regs.size(); ++i) {
                     uint32_t value = 0;
-                    memcpy(&value, context.data() + 0x8C + i * 4, sizeof(value));
+                    std::memcpy(&value, context.data() + 0x8C + i * 4, sizeof(value));
                     set_x86_reg_value(x86_regs[i], value);
                 }
             } else {
@@ -462,7 +463,7 @@ void c_emulator_ctx::raise_exception(const uint32_t exception_code) {
                 apply(0xF8, UC_X86_REG_RIP);
 
                 uint32_t eflags = 0;
-                memcpy(&eflags, context.data() + 0x44, sizeof(eflags));
+                std::memcpy(&eflags, context.data() + 0x44, sizeof(eflags));
                 set_x86_reg_value(UC_X86_REG_EFLAGS, eflags);
             }
 

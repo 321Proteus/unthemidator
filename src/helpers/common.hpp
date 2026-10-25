@@ -1,6 +1,7 @@
 #ifndef UNTHEMIDATOR_COMMON_HPP
 #define UNTHEMIDATOR_COMMON_HPP
 
+#include <cstdint>
 #include <string>
 
 enum class e_architecture {

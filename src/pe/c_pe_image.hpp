@@ -1,6 +1,7 @@
 #ifndef UNTHEMIDATOR_C_PE_FILE_HPP
 #define UNTHEMIDATOR_C_PE_FILE_HPP
 
+#include <cstdint>
 #include <span>
 #include <vector>
 #include <string>

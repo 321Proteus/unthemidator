@@ -1,5 +1,6 @@
 #include "c_intel_function.hpp"
 
+#include <climits>
 #include <queue>
 #include <ranges>
 

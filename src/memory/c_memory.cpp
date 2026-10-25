@@ -1,6 +1,7 @@
 #include "c_memory.hpp"
 
 #include <stdexcept>
+#include <cstdint>
 
 #include "../pe/c_pe_image.hpp"
 

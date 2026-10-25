@@ -1,6 +1,7 @@
 #include "pe_utils.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <ranges>
 #include <stdexcept>
 #include <unordered_set>

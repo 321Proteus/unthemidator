@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 

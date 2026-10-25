@@ -1,6 +1,7 @@
 #include "c_intel_disassembler.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 c_intel_disassembler::c_intel_disassembler(const std::shared_ptr<c_memory>& memory, const bool is_x64) : m_memory(memory) {
     //
@@ -137,7 +138,7 @@ c_intel_instruction c_intel_disassembler::disassemble_instruction(uint32_t rva) 
 
     std::vector<uint8_t> raw_bytes{};
     raw_bytes.resize(instruction.length);
-    memcpy(raw_bytes.data(), mapped_image.data() + rva, raw_bytes.size());
+    std::memcpy(raw_bytes.data(), mapped_image.data() + rva, raw_bytes.size());
 
     return c_intel_instruction(rva, instruction, operands, raw_bytes);
 }
