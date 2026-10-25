@@ -27,10 +27,18 @@ std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32
     s_walk_ctx ctx{
         .function = fn.get(),
         .rva_to_bb_index = {},
+        .pending = {},
     };
 
-    if (!walk_basic_block(rva, ctx).has_value()) {
-        return nullptr;
+    ctx.pending.push_back(rva);
+
+    while (!ctx.pending.empty()) {
+        const auto block_rva = ctx.pending.back();
+        ctx.pending.pop_back();
+
+        if (!walk_basic_block(block_rva, ctx).has_value()) {
+            return nullptr;
+        }
     }
 
     auto &blocks = fn->m_basic_blocks;
@@ -220,10 +228,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             instr.m_branch_target = target;
             bb.m_instructions.push_back(std::move(instr));
 
-            if (!walk_basic_block(static_cast<uint32_t>(target), ctx).has_value()) {
-                return std::nullopt;
-            }
-
+            ctx.pending.push_back(static_cast<uint32_t>(target));
             break;
         }
 
@@ -243,14 +248,9 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             instr.m_branch_target = target;
             bb.m_instructions.push_back(std::move(instr));
 
-            if (!walk_basic_block(static_cast<uint32_t>(target), ctx).has_value()) {
-                return std::nullopt;
-            }
-
-            if (!walk_basic_block(fallthrough, ctx).has_value()) {
-                return std::nullopt;
-            }
-
+            // pushed in reverse so the target is walked first
+            ctx.pending.push_back(fallthrough);
+            ctx.pending.push_back(static_cast<uint32_t>(target));
             break;
         }
 
