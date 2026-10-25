@@ -191,21 +191,21 @@ void hooks::rtl_allocate_heap(const c_emulator_ctx *ctx) {
 }
 
 void hooks::get_current_dir(const c_emulator_ctx *ctx) {
-    const auto path = std::wstring(L"\\C:\\bebra.exe");
+    const auto path = std::u16string(u"\\C:\\bebra.exe");
 
     const auto buff_ptr = ctx->get_arg(1);
-    uc_mem_write(ctx->get_uc(), buff_ptr, path.data(), path.length() * sizeof(wchar_t));
+    uc_mem_write(ctx->get_uc(), buff_ptr, path.data(), path.length() * sizeof(char16_t));
 
-    ctx->set_result(path.length() * sizeof(wchar_t) + 2);
+    ctx->set_result(path.length() * sizeof(char16_t) + 2);
 }
 
 void hooks::get_module_filename(const c_emulator_ctx *ctx) {
-    const auto path = std::wstring(L"\\C:\\");
+    const auto path = std::u16string(u"\\C:\\");
 
     const auto buff_ptr = ctx->get_arg(1);
-    uc_mem_write(ctx->get_uc(), buff_ptr, path.data(), path.length() * sizeof(wchar_t));
+    uc_mem_write(ctx->get_uc(), buff_ptr, path.data(), path.length() * sizeof(char16_t));
 
-    ctx->set_result(path.length() * sizeof(wchar_t) + 2);
+    ctx->set_result(path.length() * sizeof(char16_t) + 2);
 }
 
 void hooks::get_command_line_a(const c_emulator_ctx *ctx) {
