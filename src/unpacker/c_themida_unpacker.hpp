@@ -34,6 +34,7 @@ public:
     [[nodiscard]] bool should_stop(uint64_t address) const;
 private:
     [[nodiscard]] bool is_vm_enter(uint64_t address, std::shared_ptr<c_intel_function> disassembled);
+    [[nodiscard]] bool may_be_vm_enter(uint64_t address) const;
     [[nodiscard]] std::shared_ptr<s_themida_vm_handler> discover_vm_handler(uint64_t address);
 
     void run_virtual_instruction(uint64_t address);
