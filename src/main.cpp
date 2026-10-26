@@ -126,9 +126,10 @@ int main(int argc, char *argv[]) {
     }
 
     const auto &output_path = options.m_output_path;
-    std::cout << "[unthemidator] loading pe file..." << std::endl;
 
-    printf("file name %s , output - %s\n", input_path.c_str(), output_path.c_str());
+    std::cout << "[unthemidator] loading pe file..." << std::endl;
+    std::cout << "[unthemidator] input file: " << input_path << std::endl;
+    std::cout << "[unthemidator] output file: " << output_path << std::endl;
 
     auto raw = utils::read_file(input_path);
 
@@ -202,8 +203,11 @@ int main(int argc, char *argv[]) {
                     { "RaiseException", { hooks::raise_exception, 4 } },
                     { "CheckRemoteDebuggerPresent", { hooks::check_remote_debugger, 2 } },
                     { "IsWow64Process", { hooks::is_wow64_process, 2 } },
+                    { "IsWow64Process2", { hooks::is_wow64_process2, 3 } },
                     { "GetFileSize", { hooks::get_file_size, 2 } },
                     { "MapViewOfFile", { hooks::map_view_of_file, 5 } },
+                    { "LocalAlloc", { hooks::local_alloc, 2 } },
+                    { "CreateThread", { hooks::create_thread, 6 } },
 
                     { "CreateFileW", { hooks::dummy_true_function, 7 } },
                     { "CreateFileMappingW", { hooks::dummy_true_function, 6 } },
@@ -231,6 +235,9 @@ int main(int argc, char *argv[]) {
                     { "Process32NextW", { hooks::process_next_w, 2 } },
                     { "lstrcmpiA", { hooks::dummy_true_function, 2 } },
                     { "GetSystemFirmwareTable", { hooks::dummy_function, 4 } },
+                    { "SetEnvironmentVariableA", { hooks::dummy_function, 2 } },
+                    { "SetEnvironmentVariableW", { hooks::dummy_function, 2 } },
+                    { "Sleep", { hooks::dummy_function, 0 } },
                 }
             },
             {
@@ -245,6 +252,10 @@ int main(int argc, char *argv[]) {
                     { "NtQuerySystemInformation", { hooks::nt_query_system_information, 4 } },
                     { "ZwProtectVirtualMemory", { hooks::nt_protect_virtual_memory, 5 } },
                     { "NtProtectVirtualMemory", { hooks::nt_protect_virtual_memory, 5 } },
+                    { "NtQueryObject", { hooks::nt_query_object, 5 } },
+                    { "ZwQueryObject", { hooks::nt_query_object, 5 } },
+                    { "NtMapViewOfSection", { hooks::nt_map_view_of_section, 10 } },
+                    { "ZwMapViewOfSection", { hooks::nt_map_view_of_section, 10 } },
 
                     { "RtlInitializeCriticalSection", { hooks::dummy_function, 1 } },
                     { "ZwSetInformationThread", { hooks::dummy_function, 4 } },
@@ -252,6 +263,10 @@ int main(int argc, char *argv[]) {
                     { "RtlFreeHeap", { hooks::dummy_true_function, 3 } },
                     { "ZwFlushInstructionCache", { hooks::dummy_function, 3 } },
                     { "NtFlushInstructionCache", { hooks::dummy_function, 3 } },
+                    { "NtOpenSection", { hooks::dummy_function, 3 } },
+                    { "ZwOpenSection", { hooks::dummy_function, 3 } },
+                    { "NtClose", { hooks::dummy_function, 1 } },
+                    { "ZwClose", { hooks::dummy_function, 1 } },
                 }
             },
             {
@@ -275,6 +290,10 @@ int main(int argc, char *argv[]) {
                     { "RegCloseKey", { hooks::dummy_function, 1 } },
                     { "AllocateAndInitializeSid", { hooks::dummy_true_function, 11 } },
                     { "FreeSid", { hooks::dummy_true_function, 1 } },
+                    { "SetEntriesInAclA", { hooks::dummy_true_function, 4 } },
+                    { "SetEntriesInAclW", { hooks::dummy_true_function, 4 } },
+                    { "InitializeSecurityDescriptor", { hooks::dummy_true_function, 2 } },
+                    { "SetSecurityDescriptorDacl", { hooks::dummy_true_function, 4 } },
                 }
             },
             {
@@ -383,7 +402,7 @@ int main(int argc, char *argv[]) {
     }
 
     try {
-        pe_builder->build();
+        pe_builder->build(*emulator_ctx);
 
         // save rebuilt PE file
         const auto &bin = pe_builder->get_built_pe();

@@ -32,8 +32,8 @@ public:
     [[nodiscard]] uint32_t get_entry_rva() const;
     [[nodiscard]] uint32_t get_size_of_headers() const;
 
-    [[nodiscard]] std::vector<uint8_t> get_original_mapping() const;
-    [[nodiscard]] std::vector<uint8_t> get_mapped_image() const;
+    [[nodiscard]] const std::vector<uint8_t>& get_original_mapping() const;
+    [[nodiscard]] const std::vector<uint8_t>& get_mapped_image() const;
 
     [[nodiscard]] bool is_x64() const;
     [[nodiscard]] uint16_t get_ptr_size() const;
@@ -42,7 +42,7 @@ public:
 
     [[nodiscard]] const std::vector<s_export>& get_exports() const;
     [[nodiscard]] const std::vector<s_section>& get_sections() const;
-    [[nodiscard]] std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> get_imports() const;
+    [[nodiscard]] const std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>>& get_imports() const;
 private:
     void parse();
 

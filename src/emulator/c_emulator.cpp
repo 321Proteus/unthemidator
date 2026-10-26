@@ -91,6 +91,13 @@ c_emulator::c_emulator(const e_architecture architecture, const e_platform platf
 std::shared_ptr<c_emulator_ctx> c_emulator::create_context() {
     const auto uc = create_uc_engine();
 
+    // Share the memory manager's backing page so updates are visible immediately.
+    if (uc_mem_map_ptr(uc, c_memory::k_shared_data_base, c_memory::k_shared_data_size, UC_PROT_READ,
+        const_cast<s_kuser_shared_data*>(&m_memory_manager->get_shared_data())) != UC_ERR_OK) {
+        uc_close(uc);
+        throw std::runtime_error("emulator: failed to map KUSER_SHARED_DATA");
+    }
+
     if (m_architecture == e_architecture::k_x86 &&
         (m_memory_manager->get_image_base() > UINT32_MAX ||
             m_memory_manager->get_image_size() > UINT32_MAX - m_memory_manager->get_image_base() ||

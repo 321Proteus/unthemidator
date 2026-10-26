@@ -8,6 +8,7 @@ namespace hooks {
     void get_module_handle(const c_emulator_ctx *ctx);
     void get_proc_address(const c_emulator_ctx *ctx);
     void rtl_allocate_heap(const c_emulator_ctx *ctx);
+    void local_alloc(const c_emulator_ctx *ctx);
     void get_current_dir(const c_emulator_ctx *ctx);
     void get_module_filename(const c_emulator_ctx *ctx);
     void get_command_line_a(const c_emulator_ctx *ctx);
@@ -18,9 +19,11 @@ namespace hooks {
     void virtual_alloc(const c_emulator_ctx *ctx);
     void virtual_protect(const c_emulator_ctx *ctx);
     void map_view_of_file(const c_emulator_ctx *ctx);
+    void nt_map_view_of_section(const c_emulator_ctx *ctx);
     void get_file_size(const c_emulator_ctx *ctx);
     void get_token_information(const c_emulator_ctx *ctx);
     void get_thread_context(const c_emulator_ctx *ctx);
+    void create_thread(const c_emulator_ctx *ctx);
 
     void message_box_ex_w(const c_emulator_ctx *ctx);
     void message_box_ex_a(const c_emulator_ctx *ctx);
@@ -28,8 +31,10 @@ namespace hooks {
     void nt_query_information_process(const c_emulator_ctx *ctx);
     void nt_query_system_information(const c_emulator_ctx *ctx);
     void nt_protect_virtual_memory(const c_emulator_ctx *ctx);
+    void nt_query_object(const c_emulator_ctx *ctx);
     void check_remote_debugger(const c_emulator_ctx *ctx);
     void is_wow64_process(const c_emulator_ctx *ctx);
+    void is_wow64_process2(const c_emulator_ctx *ctx);
     void get_current_process_id(const c_emulator_ctx *ctx);
     void get_current_thread_id(const c_emulator_ctx *ctx);
     void get_last_error(const c_emulator_ctx *ctx);

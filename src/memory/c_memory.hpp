@@ -6,6 +6,9 @@
 #include <optional>
 #include <memory>
 #include <string>
+#include <chrono>
+
+#include "kuser_shared_data.hpp"
 
 class c_pe_image;
 
@@ -15,9 +18,15 @@ inline uint64_t page_up(const uint64_t address, const uint64_t page_size) {
 
 class c_memory {
 public:
+    static constexpr uint64_t k_shared_data_base = 0x7FFE0000;
+    static constexpr uint32_t k_shared_data_size = 0x1000;
+
+    [[nodiscard]] static bool overlaps_shared_data(uint64_t address, uint64_t size);
+    [[nodiscard]] const unthemidator::windows::s_kuser_shared_data& get_shared_data() const;
+
     explicit c_memory(const std::shared_ptr<c_pe_image>& pe_image);
 
-    [[nodiscard]] std::vector<uint8_t> get_mapped_image() const;
+    [[nodiscard]] const std::vector<uint8_t>& get_mapped_image() const;
     [[nodiscard]] std::shared_ptr<c_pe_image> get_pe_image() const;
 
     [[nodiscard]] uint64_t get_image_base() const;
@@ -48,6 +57,10 @@ public:
         return true;
     }
 protected:
+    mutable unthemidator::windows::s_kuser_shared_data m_shared_data{};
+    const std::chrono::steady_clock::time_point m_clock_start = std::chrono::steady_clock::now();
+    const std::chrono::system_clock::time_point m_system_time_start = std::chrono::system_clock::now();
+
     uint64_t m_image_base;
     uint32_t m_image_size;
 

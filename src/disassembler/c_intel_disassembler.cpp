@@ -11,7 +11,7 @@ c_intel_disassembler::c_intel_disassembler(const std::shared_ptr<c_memory>& memo
     }
 }
 
-std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32_t rva) {
+std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32_t rva, const size_t instruction_limit) {
     const std::lock_guard decoder_guard(m_decoder_mtx);
 
     if (const auto &mapped_image = m_memory->get_mapped_image();
@@ -26,6 +26,7 @@ std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32
     s_walk_ctx ctx{
         .function = fn.get(),
         .rva_to_bb_index = {},
+        .instruction_limit = instruction_limit,
     };
 
     if (!walk_basic_block(rva, ctx).has_value()) {
@@ -142,123 +143,145 @@ c_intel_instruction c_intel_disassembler::disassemble_instruction(uint32_t rva) 
     return c_intel_instruction(rva, instruction, operands, raw_bytes);
 }
 
-std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_walk_ctx &ctx) {
+std::optional<size_t> c_intel_disassembler::walk_basic_block(const uint32_t rva, s_walk_ctx &ctx) const {
     if (const auto it = ctx.rva_to_bb_index.find(rva); it != ctx.rva_to_bb_index.end()) {
         return it->second;
     }
 
     const auto &mapped_image = m_memory->get_mapped_image();
+    auto &blocks = ctx.function->m_basic_blocks;
 
-    const size_t block_index = ctx.function->m_basic_blocks.size();
-    ctx.rva_to_bb_index[rva] = block_index;
+    // indices of blocks that were discovered but not decoded yet
+    std::vector<size_t> worklist;
 
-    c_intel_basic_block block;
-    block.m_start_rva = rva;
-    block.m_end_rva = rva;
-    ctx.function->m_basic_blocks.push_back(std::move(block));
-
-    uint32_t cursor = rva;
-
-    while (true) {
-        auto &bb = ctx.function->m_basic_blocks[block_index];
-
-        if (cursor + ZYDIS_MAX_INSTRUCTION_LENGTH > mapped_image.size()) {
-            break;
+    // registers a block (once per rva) and queues it for decoding,
+    // the empty block is a placeholder; it is filled in when popped
+    const auto discover = [&](const uint32_t start) {
+        if (ctx.rva_to_bb_index.contains(start)) {
+            return;
         }
 
-        ZydisDecodedInstruction decoded{};
-        std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands{};
+        const size_t index = blocks.size();
+        ctx.rva_to_bb_index[start] = index;
 
-        const auto status = ZydisDecoderDecodeFull(&m_decoder, mapped_image.data() + cursor,
-            ZYDIS_MAX_INSTRUCTION_LENGTH, &decoded, operands.data());
+        c_intel_basic_block placeholder;
+        placeholder.m_start_rva = start;
+        placeholder.m_end_rva = start;
+        blocks.push_back(std::move(placeholder));
 
-        if (!ZYAN_SUCCESS(status)) {
-            return std::nullopt;
-        }
+        worklist.push_back(index);
+    };
 
-        std::vector<uint8_t> raw_bytes(decoded.length);
-        std::memcpy(raw_bytes.data(), mapped_image.data() + cursor, decoded.length);
+    discover(rva);
 
-        c_intel_instruction instr;
-        instr.m_rva = cursor;
-        instr.m_instruction = decoded;
-        instr.m_operands = operands;
-        instr.m_raw_bytes = std::move(raw_bytes);
-        instr.m_branch_target = 0;
+    const size_t entry_index = ctx.rva_to_bb_index[rva];
+    size_t instruction_count = 0;
 
-        bb.m_end_rva = cursor + decoded.length;
+    while (!worklist.empty()) {
+        const size_t block_index = worklist.back();
+        worklist.pop_back();
 
-        const auto category = decoded.meta.category;
-        const auto mnemonic = decoded.mnemonic;
+        // decode into a local block. `blocks` may reallocate whenever discover()
+        // is called, so no reference into it is held while decoding
+        c_intel_basic_block bb;
+        bb.m_start_rva = blocks[block_index].m_start_rva;
+        bb.m_end_rva = bb.m_start_rva;
 
-        // ret / int / ud2 are function/block terminators, no successors to follow.
-        if (category == ZYDIS_CATEGORY_RET || category == ZYDIS_CATEGORY_INTERRUPT || mnemonic == ZYDIS_MNEMONIC_UD2) {
-            if (category == ZYDIS_CATEGORY_RET) {
-                bb.m_is_final = true;
-            } else {
-                bb.m_end_rva = cursor;
+        uint32_t cursor = bb.m_start_rva;
+
+        while (true) {
+            if (static_cast<size_t>(cursor) + ZYDIS_MAX_INSTRUCTION_LENGTH > mapped_image.size()) {
+                break;
             }
 
-            bb.m_instructions.push_back(std::move(instr));
-            break;
-        }
+            ZydisDecodedInstruction decoded{};
+            std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands{};
 
-        if (mnemonic == ZYDIS_MNEMONIC_JMP) {
-            if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                // indirect jump , treat as function exit.
+            const auto status = ZydisDecoderDecodeFull(&m_decoder, mapped_image.data() + cursor,
+                ZYDIS_MAX_INSTRUCTION_LENGTH, &decoded, operands.data());
+
+            if (!ZYAN_SUCCESS(status)) {
+                return std::nullopt;
+            }
+
+            if (ctx.instruction_limit && ++instruction_count >= ctx.instruction_limit) {
+                return std::nullopt;
+            }
+
+            std::vector<uint8_t> raw_bytes(decoded.length);
+            std::memcpy(raw_bytes.data(), mapped_image.data() + cursor, decoded.length);
+
+            c_intel_instruction instr;
+            instr.m_rva = cursor;
+            instr.m_instruction = decoded;
+            instr.m_operands = operands;
+            instr.m_raw_bytes = std::move(raw_bytes);
+            instr.m_branch_target = 0;
+
+            bb.m_end_rva = cursor + decoded.length;
+
+            const auto category = decoded.meta.category;
+            const auto mnemonic = decoded.mnemonic;
+
+            // Returns, interrupts and undefined instructions end exploration.
+            if (category == ZYDIS_CATEGORY_RET || category == ZYDIS_CATEGORY_INTERRUPT ||
+                mnemonic == ZYDIS_MNEMONIC_UD0 || mnemonic == ZYDIS_MNEMONIC_UD1 || mnemonic == ZYDIS_MNEMONIC_UD2) {
                 bb.m_is_final = true;
+
                 bb.m_instructions.push_back(std::move(instr));
                 break;
             }
 
-            uint64_t target = 0;
-            if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(&decoded, operands.data(), cursor, &target))) {
-                return std::nullopt;
+            if (mnemonic == ZYDIS_MNEMONIC_JMP) {
+                if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    // indirect jump, treat as function exit
+                    bb.m_is_final = true;
+                    bb.m_instructions.push_back(std::move(instr));
+                    break;
+                }
+
+                uint64_t target = 0;
+                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(&decoded, operands.data(), cursor, &target))) {
+                    return std::nullopt;
+                }
+
+                instr.m_branch_target = target;
+                bb.m_instructions.push_back(std::move(instr));
+
+                discover(static_cast<uint32_t>(target));
+                break;
             }
 
-            instr.m_branch_target = target;
+            // conditional branch: queue both the target and the fallthrough
+            if (category == ZYDIS_CATEGORY_COND_BR) {
+                if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    return std::nullopt;
+                }
+
+                uint64_t target = 0;
+                if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(&decoded, operands.data(), cursor, &target))) {
+                    return std::nullopt;
+                }
+
+                const uint32_t fallthrough = cursor + decoded.length;
+
+                instr.m_branch_target = target;
+                bb.m_instructions.push_back(std::move(instr));
+
+                discover(static_cast<uint32_t>(target));
+                discover(fallthrough);
+                break;
+            }
+
+            // ordinary instruction, extend the block and continue
             bb.m_instructions.push_back(std::move(instr));
-
-            if (!walk_basic_block(static_cast<uint32_t>(target), ctx).has_value()) {
-                return std::nullopt;
-            }
-
-            break;
+            cursor += decoded.length;
         }
 
-        // conditional branch — analyze both target and fallthrough.
-        if (category == ZYDIS_CATEGORY_COND_BR) {
-            if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                return std::nullopt;
-            }
-
-            uint64_t target = 0;
-            if (ZYAN_FAILED(ZydisCalcAbsoluteAddress(&decoded, operands.data(), cursor, &target))) {
-                return std::nullopt;
-            }
-
-            const uint32_t fallthrough = cursor + decoded.length;
-
-            instr.m_branch_target = target;
-            bb.m_instructions.push_back(std::move(instr));
-
-            if (!walk_basic_block(static_cast<uint32_t>(target), ctx).has_value()) {
-                return std::nullopt;
-            }
-
-            if (!walk_basic_block(fallthrough, ctx).has_value()) {
-                return std::nullopt;
-            }
-
-            break;
-        }
-
-        // ordinary instruction — extend the block and continue.
-        bb.m_instructions.push_back(std::move(instr));
-        cursor += decoded.length;
+        blocks[block_index] = std::move(bb);
     }
 
-    return block_index;
+    return entry_index;
 }
 
 void c_intel_disassembler::add_edge(const size_t from_index, const size_t to_index, c_intel_function &fn) {

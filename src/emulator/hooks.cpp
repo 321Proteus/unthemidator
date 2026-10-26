@@ -8,11 +8,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #include "../unpacker/c_themida_unpacker.hpp"
 
 namespace {
     constexpr uint32_t k_protection_marker = 0x676767;
+    constexpr uint64_t k_created_thread_handle = 0x1337;
 
     uint64_t teb_field(const c_emulator_ctx *ctx, const uint32_t offset32, const uint32_t offset64) {
         return ctx->get_memory()->get_address_by_tag("TEB").value() +
@@ -23,6 +25,40 @@ namespace {
         if (!ctx->write<uint32_t>(teb_field(ctx, 0x34, 0x68), error)) {
             throw std::runtime_error("failed to write last error");
         }
+    }
+
+    struct s_file_view {
+        uint64_t base = 0;
+        uint32_t size = 0;
+        uint32_t status = 0;
+    };
+
+    s_file_view map_file_view(const c_emulator_ctx *ctx, const std::vector<uint8_t>& file,
+        const uint64_t offset, uint64_t bytes) {
+        if (offset >= file.size()) {
+            return { .status = 0xC000000D }; // STATUS_INVALID_PARAMETER.
+        }
+        const auto remaining = file.size() - offset;
+        if (!bytes) {
+            bytes = remaining;
+        }
+        if (bytes > remaining || bytes > UINT32_MAX - 0xFFF) {
+            return { .status = 0xC000001F }; // STATUS_INVALID_VIEW_SIZE.
+        }
+
+        const auto size = static_cast<uint32_t>(page_up(bytes, 0x1000));
+        const auto base = ctx->allocate_storage(size, "file mapping view");
+        // A view maps whole pages. Preserve file bytes through the last page;
+        // allocate_storage zero-fills only the tail beyond EOF.
+        const auto copy_size = std::min<uint64_t>(size, remaining);
+        if (uc_mem_write(ctx->get_uc(), base, file.data() + offset, copy_size) != UC_ERR_OK) {
+            uc_mem_unmap(ctx->get_uc(), base, size);
+            return { .status = 0xC0000005 }; // STATUS_ACCESS_VIOLATION.
+        }
+
+        printf("[unthemidator][runtime] file view: backing=original-input-file offset=0x%llX "
+            "bytes=0x%llX -> base=0x%llX mapped_size=0x%X\n", offset, bytes, base, size);
+        return { base, size, 0 };
     }
 
     template<typename T, typename C>
@@ -162,29 +198,39 @@ void hooks::get_proc_address(const c_emulator_ctx *ctx) {
         throw std::runtime_error("hooks: get proc address from local module is not implemented");
     }
 
-    char buffer[64]{};
-    uc_mem_read(ctx->get_uc(), name_ptr, buffer, sizeof(buffer));
+    std::string function_name;
+    uint64_t address = 0;
 
-    uint32_t ordinal;
-    uc_mem_read(ctx->get_uc(), name_ptr, &ordinal, sizeof(ordinal));
+    if (name_ptr <= UINT16_MAX) {
+        const auto ordinal = static_cast<uint16_t>(name_ptr);
 
-    const auto function_name = std::string(buffer);
-    const auto address = ctx->get_imports()->resolve_import(module_handle, function_name);
+        function_name = "#" + std::to_string(ordinal) + " (ordinal)";
+        address = ctx->get_imports()->resolve_import(module_handle, ordinal);
+    } else {
+        char buffer[64]{};
+
+        if (uc_mem_read(ctx->get_uc(), name_ptr, buffer, sizeof(buffer) - 1) == UC_ERR_OK) {
+            function_name = buffer;
+            address = ctx->get_imports()->resolve_import(module_handle, function_name);
+        }
+    }
 
     std::cout << "[unthemidator][runtime] loaded function " << function_name << std::hex << " (0x" <<
         address << ") from mod 0x" << module_handle << std::dec << std::endl;
-
-    // fallback to ordinal search
-    if (address == 0) {
-        throw std::runtime_error("runtime: failed to resolve function address for " + function_name);
-    }
-
+    
     ctx->set_result(address);
 }
 
 void hooks::rtl_allocate_heap(const c_emulator_ctx *ctx) {
     const auto size = static_cast<uint32_t>(ctx->get_arg(2));
     const auto base = ctx->allocate_storage(size, "heap");
+
+    ctx->set_result(base);
+}
+
+void hooks::local_alloc(const c_emulator_ctx *ctx) {
+    const auto size = static_cast<uint32_t>(ctx->get_arg(1));
+    const auto base = ctx->allocate_storage(size, "local_alloc");
 
     ctx->set_result(base);
 }
@@ -199,7 +245,7 @@ void hooks::get_current_dir(const c_emulator_ctx *ctx) {
 }
 
 void hooks::get_module_filename(const c_emulator_ctx *ctx) {
-    constexpr auto path = std::wstring(L"\\C:\\");
+    const auto path = std::wstring(L"\\C:\\");
 
     const auto buff_ptr = ctx->get_arg(1);
     uc_mem_write(ctx->get_uc(), buff_ptr, path.data(), path.length() * sizeof(wchar_t));
@@ -210,7 +256,7 @@ void hooks::get_module_filename(const c_emulator_ctx *ctx) {
 void hooks::get_command_line_a(const c_emulator_ctx *ctx) {
     const auto str_location = ctx->allocate_storage(0x100);
 
-    constexpr std::string command_line = R"("C:\bebra.exe")";
+    const std::string command_line = R"("C:\bebra.exe")";
     uc_mem_write(ctx->get_uc(), str_location, command_line.data(), command_line.length());
 
     ctx->set_result(str_location);
@@ -255,7 +301,6 @@ void hooks::virtual_protect(const c_emulator_ctx *ctx) {
     const auto old_prot_ptr = ctx->get_arg(3);
 
     handle_virtual_protection(ctx, address, size, new_prot, old_prot_ptr);
-
     ctx->set_result(1);
 }
 
@@ -269,61 +314,135 @@ void hooks::raise_exception(c_emulator_ctx *ctx) {
 }
 
 void hooks::map_view_of_file(const c_emulator_ctx *ctx) {
-    const auto mapping_handle = ctx->get_arg(0);
-    const auto offset_high = static_cast<uint32_t>(ctx->get_arg(2));
-    const auto offset_low = static_cast<uint32_t>(ctx->get_arg(3));
+    const auto handle = ctx->get_arg(0);
+    const auto offset = (static_cast<uint64_t>(static_cast<uint32_t>(ctx->get_arg(2))) << 32) |
+        static_cast<uint32_t>(ctx->get_arg(3));
+    const auto bytes = ctx->get_arg(4);
 
-    auto bytes_to_map = ctx->get_arg(4);
-
-    const auto &file = ctx->get_original_file_mapping();
-
-    const auto file_size = (static_cast<uint32_t>(file.size()));
-    const auto file_offset = (static_cast<uint64_t>(offset_high) << 32) | offset_low;
-
-    if (!mapping_handle || file_offset >= file_size || file_offset & 0xFFFF) {
+    if (!handle || offset & 0xFFFF) {
+        write_last_error(ctx, !handle ? 6 : 1132); // INVALID_HANDLE / MAPPED_ALIGNMENT
         ctx->set_result(0);
         return;
     }
 
-    if (!bytes_to_map) {
-        bytes_to_map = file_size - file_offset;
+    printf("[unthemidator][runtime] MapViewOfFile: handle=0x%llX offset=0x%llX size=0x%llX\n",
+        handle, offset, bytes);
+
+    const auto view = map_file_view(ctx, ctx->get_original_file_mapping(), offset, bytes);
+
+    if (view.status) {
+        write_last_error(ctx, view.status == 0xC0000005 ? 998 : 87); // NOACCESS / INVALID_PARAMETER
     }
 
-    if (bytes_to_map > file_size - file_offset || bytes_to_map > UINT32_MAX - 0xFFF) {
-        ctx->set_result(0);
-        return;
+    ctx->set_result(view.base);
+}
+
+void hooks::nt_map_view_of_section(const c_emulator_ctx *ctx) {
+    const auto section = ctx->get_arg(0);
+    const auto process = ctx->get_arg(1);
+    const auto base_ptr = ctx->get_arg(2);
+    const auto offset_ptr = ctx->get_arg(5);
+    const auto size_ptr = ctx->get_arg(6);
+    const auto protection = ctx->get_arg(9);
+
+    const auto map = [&]<typename T>() {
+        const auto base = ctx->read<T>(base_ptr);
+        const auto size = ctx->read<T>(size_ptr);
+        const auto offset = offset_ptr ? ctx->read<uint64_t>(offset_ptr) : std::optional<uint64_t>{0};
+        const auto finish = [&](const uint32_t status) {
+            printf("[unthemidator][runtime] NtMapViewOfSection: section=0x%llX process=0x%llX status=0x%08X\n",
+                section, process, status);
+            ctx->set_result(status);
+        };
+
+        if (!base_ptr || !size_ptr || !base || !size || !offset) {
+            finish(0xC0000005); // STATUS_ACCESS_VIOLATION.
+            return;
+        }
+
+        printf("[unthemidator][runtime] NtMapViewOfSection: section=0x%llX requested_base=0x%llX "
+            "offset=0x%llX size=0x%llX protection=0x%llX\n", section,
+            static_cast<uint64_t>(*base), *offset, static_cast<uint64_t>(*size), protection);
+
+        if (!section) {
+            finish(0xC0000008); // STATUS_INVALID_HANDLE.
+            return;
+        }
+        if (*base || ctx->get_arg(3) || ctx->get_arg(8)) {
+            finish(0xC00000BB); // STATUS_NOT_SUPPORTED: fixed addresses, ZeroBits, allocation flags.
+            return;
+        }
+
+        // Same minimal backing model as MapViewOfFile: the original input file.
+        const auto &file = ctx->get_original_file_mapping();
+        const auto file_offset = *offset & ~uint64_t{0xFFFF};
+        if (file_offset >= file.size()) {
+            finish(0xC000000D); // STATUS_INVALID_PARAMETER.
+            return;
+        }
+        const auto remaining = file.size() - file_offset;
+        if (*size > page_up(remaining, 0x1000)) {
+            finish(0xC000001F); // STATUS_INVALID_VIEW_SIZE.
+            return;
+        }
+        // Native section views may request the final, partially file-backed page.
+        const auto bytes = *size ? std::min<uint64_t>(*size, remaining) : remaining;
+
+        // Probe in/out storage before allocating or publishing a view. In
+        // particular, a read-only ViewSize must not leave BaseAddress dangling.
+        if (!ctx->write<T>(base_ptr, *base) || !ctx->write<T>(size_ptr, *size) ||
+            (offset_ptr && !ctx->write<uint64_t>(offset_ptr, *offset))) {
+            finish(0xC0000005);
+            return;
+        }
+
+        const auto view = map_file_view(ctx, file, file_offset, bytes);
+        if (view.status) {
+            finish(view.status);
+            return;
+        }
+
+        if (!ctx->write<T>(base_ptr, static_cast<T>(view.base)) ||
+            !ctx->write<T>(size_ptr, static_cast<T>(view.size)) ||
+            (offset_ptr && !ctx->write<uint64_t>(offset_ptr, file_offset))) {
+            (void)ctx->write<T>(base_ptr, *base);
+            (void)ctx->write<T>(size_ptr, *size);
+            if (offset_ptr) {
+                (void)ctx->write<uint64_t>(offset_ptr, *offset);
+            }
+            uc_mem_unmap(ctx->get_uc(), view.base, view.size);
+            finish(0xC0000005);
+            return;
+        }
+
+        ctx->set_result(0); // STATUS_SUCCESS.
+    };
+
+    if (ctx->get_arch() == e_architecture::k_x86) {
+        map.operator()<uint32_t>();
+    } else {
+        map.operator()<uint64_t>();
     }
-
-    const auto mapped_size = static_cast<uint32_t>(bytes_to_map + 0xFFF & ~static_cast<uint64_t>(0xFFF));
-
-    // allocate memory for the mapped file
-    const auto mapping_base = ctx->allocate_storage(mapped_size);
-
-    if (uc_mem_write(ctx->get_uc(), mapping_base, file.data() +
-        static_cast<size_t>(file_offset), bytes_to_map) != UC_ERR_OK) {
-        //
-        uc_mem_unmap(ctx->get_uc(), mapping_base, mapped_size);
-        throw std::runtime_error("MapViewOfFile: failed to write mapped file");
-    }
-
-    ctx->set_result(mapping_base);
 }
 
 void hooks::get_file_size(const c_emulator_ctx *ctx) {
     const auto file_size_high_ptr = ctx->get_arg(1);
 
-    const auto file_size = static_cast<uint32_t>(ctx->get_original_file_mapping().size());
+    const auto file_size = static_cast<uint64_t>(ctx->get_original_file_mapping().size());
     const auto file_size_low = static_cast<uint32_t>(file_size);
 
-    constexpr auto file_size_high = 0;
+    const auto file_size_high = static_cast<uint32_t>(file_size >> 32);
 
-    if (file_size_high_ptr && uc_mem_write(ctx->get_uc(), file_size_high_ptr, &file_size_high,
-        sizeof(file_size_high)) != UC_ERR_OK) {
+    if (file_size_high_ptr && !ctx->write<uint32_t>(file_size_high_ptr, file_size_high)) {
         //
+        write_last_error(ctx, 998); // ERROR_NOACCESS.
         ctx->set_result(0xFFFFFFFF);
         return;
     }
 
+    if (file_size_low == UINT32_MAX) {
+        write_last_error(ctx, 0); // Distinguish a valid size from INVALID_FILE_SIZE.
+    }
     ctx->set_result(file_size_low);
 }
 
@@ -366,6 +485,11 @@ void hooks::get_thread_context(const c_emulator_ctx *ctx) {
     }
 
     ctx->set_result(1);
+}
+
+void hooks::create_thread(const c_emulator_ctx *ctx) {
+    ctx->get_themida_unpacker()->on_thread_create(ctx->get_arg(2), ctx->get_arg(3));
+    ctx->set_result(k_created_thread_handle);
 }
 
 void hooks::message_box_ex_w(const c_emulator_ctx *ctx) {
@@ -566,6 +690,54 @@ void hooks::nt_protect_virtual_memory(const c_emulator_ctx *ctx) {
     ctx->set_result(0);
 }
 
+void hooks::nt_query_object(const c_emulator_ctx *ctx) {
+    if (static_cast<uint32_t>(ctx->get_arg(1)) != 0) { // ObjectBasicInformation
+        throw std::runtime_error("NtQueryObject: unsupported information class");
+    }
+
+    if (ctx->get_arg(0) != k_created_thread_handle) {
+        ctx->set_result(0xC0000008); // STATUS_INVALID_HANDLE
+        return;
+    }
+
+    // PUBLIC_OBJECT_BASIC_INFORMATION has the same layout on x86 and x64
+    struct s_object_basic_information {
+        uint32_t attributes, granted_access, handle_count, pointer_count;
+        uint32_t reserved[10];
+    };
+
+    static_assert(sizeof(s_object_basic_information) == 0x38);
+
+    constexpr s_object_basic_information info{
+        .attributes = 0,
+        .granted_access = 0x001FFFFF, // THREAD_ALL_ACCESS
+        .handle_count = 1,
+        .pointer_count = 2,
+        .reserved = {}
+    };
+
+    if (const auto return_length = ctx->get_arg(4);
+        return_length && !ctx->write<uint32_t>(return_length, sizeof(info))) {
+        //
+        ctx->set_result(0xC0000005); // STATUS_ACCESS_VIOLATION
+        return;
+    }
+
+    if (static_cast<uint32_t>(ctx->get_arg(3)) < sizeof(info)) {
+        ctx->set_result(0xC0000004); // STATUS_INFO_LENGTH_MISMATCH
+        return;
+    }
+
+    if (const auto buffer = ctx->get_arg(2);
+        !buffer || !ctx->write(buffer, info)) {
+        //
+        ctx->set_result(0xC0000005); // STATUS_ACCESS_VIOLATION
+        return;
+    }
+
+    ctx->set_result(0);
+}
+
 void hooks::check_remote_debugger(const c_emulator_ctx *ctx) {
     if (ctx->write<uint32_t>(ctx->get_arg(1), 0)) {
         std::cout << "[unthemidator][runtime] bypassed remote debugger check" << std::endl;
@@ -577,6 +749,23 @@ void hooks::check_remote_debugger(const c_emulator_ctx *ctx) {
 
 void hooks::is_wow64_process(const c_emulator_ctx *ctx) {
     ctx->set_result(ctx->write<uint32_t>(ctx->get_arg(1), 0) ? 1 : 0);
+}
+
+void hooks::is_wow64_process2(const c_emulator_ctx *ctx) {
+    const auto process_machine_ptr = ctx->get_arg(1);
+    const auto native_machine_ptr = ctx->get_arg(2);
+    // The synthetic host is AMD64; native processes report IMAGE_FILE_MACHINE_UNKNOWN.
+    const uint16_t process_machine = ctx->get_arch() == e_architecture::k_x86 ? 0x014C : 0;
+    constexpr uint16_t native_machine = 0x8664;
+
+    if (!process_machine_ptr || !ctx->write<uint16_t>(process_machine_ptr, process_machine) ||
+        (native_machine_ptr && !ctx->write<uint16_t>(native_machine_ptr, native_machine))) {
+        write_last_error(ctx, 998); // ERROR_NOACCESS.
+        ctx->set_result(0);
+        return;
+    }
+
+    ctx->set_result(1);
 }
 
 void hooks::get_current_process_id(const c_emulator_ctx *ctx) {
@@ -657,9 +846,7 @@ void hooks::dummy_true_function(const c_emulator_ctx *ctx) {
 }
 
 void hooks::vm_enter(const c_emulator_ctx *ctx) {
-    // unicorn auto skips first INT3, to get the actual address, we should subtract int3 size from current PC
-    const auto vm_enter_address = ctx->get_pc() - 0x1;
+    const auto vm_enter_address = ctx->get_pc();
 
     ctx->get_themida_unpacker()->on_first_vm_enter(vm_enter_address);
-    ctx->set_result(1);
 }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <chrono>
+#include <fstream>
 #include <ranges>
 
 #include "../emulator/hooks.hpp"
@@ -145,14 +146,13 @@ void c_themida_unpacker::startup() {
 
     // add image-wide memory callback to log NX pages execution attempt to catch non-virtualized OEP
     m_emulator_ctx->add_mem_hook(UC_HOOK_MEM_FETCH_PROT,
-        [&](uc_engine* uc, const uc_mem_type, const uint64_t addr, const int, const int64_t) -> void {
+        [&](uc_engine*, const uc_mem_type, const uint64_t addr, const int, const int64_t) -> void {
             m_found_oep = true;
             m_real_entry_address = addr;
 
             on_first_vm_enter(addr);
             m_emulator_ctx->remove_mem_hook(image_base);
 
-            uc_emu_stop(uc);
         }, image_base, image_end);
 
     if (m_options.m_max_nested_vms > 0) {
@@ -162,6 +162,11 @@ void c_themida_unpacker::startup() {
             // if current RIP is not within the image, single step until a hook as fired or any other kind of magic happens
             if (pc < image_base || pc >= image_end) {
                 m_emulator_ctx->single_step();
+
+                if (m_found_oep) {
+                    break;
+                }
+
                 continue;
             }
 
@@ -210,17 +215,20 @@ void c_themida_unpacker::decompress_vms() {
     // iterate over known executable sections and find trampolines including stealth one
     if (m_vm_trampolines.empty()) {
         const auto &mapped_image = m_memory_manager->get_mapped_image();
+        uint16_t section_idx = 0;
 
         for (const auto &section: m_pe_image->get_sections()) {
+            section_idx++;
+
             if (!(section.characteristics & unthemidator::pe::k_scn_mem_execute)) {
                 continue;
             }
 
             std::vector section_dump(mapped_image.begin() + section.virtual_address,
-                                     mapped_image.begin() + section.virtual_address + section.virtual_size);
+                mapped_image.begin() + section.virtual_address + section.virtual_size);
 
             find_vm_trampolines(m_memory_manager->get_image_base() + section.virtual_address,
-                section_dump, true);
+                section_dump, (section_idx == 1));
         }
     }
 
@@ -249,7 +257,7 @@ uint32_t c_themida_unpacker::get_oep_rva() const {
     return m_real_entry_address - m_memory_manager->get_image_base();
 }
 
-std::vector<s_themida_recovered_import> c_themida_unpacker::get_recovered_imports() const {
+const std::vector<s_themida_recovered_import> &c_themida_unpacker::get_recovered_imports() const {
     return m_recovered_imports;
 }
 
@@ -337,6 +345,8 @@ void c_themida_unpacker::on_region_made_writable(const uint64_t address, const u
 }
 
 void c_themida_unpacker::on_first_vm_enter(const uint64_t address) {
+    m_emulator_ctx->stop(address);
+
     // restore vm enters' prologues
     for (const auto &trampoline : m_vm_trampolines) {
         // restore prologue
@@ -408,9 +418,25 @@ void c_themida_unpacker::on_first_vm_enter(const uint64_t address) {
     }
 }
 
+void c_themida_unpacker::on_thread_create(const uint64_t address, const uint64_t param) const {
+    // the param of CreateThread is the address of Sleep function
+    if (const auto imp = m_emulator_ctx->get_imports()->find_import_by_address(param);
+        !imp || imp->m_name != "Sleep") {
+        //
+        throw std::runtime_error("unpacker: unexpected CreateThread argument");
+    }
+
+    std::cout << "[unthemidator][startup] emulating observer thread 0x" <<
+        std::hex << address << std::dec << "..." << std::endl;
+
+    // emulate asynchronous routine until Sleep function call,
+    // cause when we're in the loop, it's safe to continue with unpacking
+    m_emulator_ctx->run_thread(address, param, param);
+}
+
 const std::vector<uint8_t>& c_themida_unpacker::get_loader_shellcode() const {
     if (!m_loader) {
-        static constexpr std::vector<uint8_t> empty{};
+        static const std::vector<uint8_t> empty{};
         return empty;
     }
 
@@ -436,6 +462,54 @@ bool c_themida_unpacker::should_stop([[maybe_unused]] const uint64_t address) co
     return m_found_oep;
 }
 
+bool c_themida_unpacker::preserves_entry_flags(const c_intel_function &function) {
+    std::unordered_set<size_t> checked_bbs{};
+    std::unordered_set<ZydisRegister> modified_regs{};
+
+    auto bb_id = function.m_first_bb_id;
+
+    while (checked_bbs.insert(bb_id).second) {
+        const auto &bb = function.m_basic_blocks.at(bb_id);
+
+        for (const auto &instr : bb.m_instructions) {
+            const auto mnemonic = instr.m_instruction.mnemonic;
+            const auto &destination = instr.m_operands[0];
+
+            const bool adjusts_saved_register =
+                (mnemonic == ZYDIS_MNEMONIC_SUB || mnemonic == ZYDIS_MNEMONIC_ADD) &&
+                destination.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                modified_regs.contains(destination.reg.value);
+
+            if (const auto flags = instr.m_instruction.cpu_flags) {
+                if ((flags->modified | flags->set_0 | flags->set_1 | flags->undefined) != 0 &&
+                    !adjusts_saved_register) {
+                    //
+                    return false;
+                }
+            }
+
+            if ((mnemonic == ZYDIS_MNEMONIC_POP || mnemonic == ZYDIS_MNEMONIC_PUSH) &&
+                destination.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                //
+                modified_regs.insert(destination.reg.value);
+            }
+
+            if (instr.m_instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFQ ||
+                instr.m_instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFD) {
+                return true;
+            }
+        }
+
+        if (bb.m_is_final || bb.m_successors.size() != 1) {
+            return false;
+        }
+
+        bb_id = bb.m_successors.back();
+    }
+
+    return false;
+}
+
 bool c_themida_unpacker::is_vm_enter(const uint64_t address, std::shared_ptr<c_intel_function> disassembled) {
     const auto image_base = m_memory_manager->get_image_base();
     const auto rva = static_cast<uint32_t>(address - image_base);
@@ -453,6 +527,10 @@ bool c_themida_unpacker::is_vm_enter(const uint64_t address, std::shared_ptr<c_i
     }
 
     if (!disassembled) {
+        return false;
+    }
+
+    if (!preserves_entry_flags(*disassembled)) {
         return false;
     }
 
@@ -635,7 +713,8 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
             continue;
         }
 
-        const auto disassembled = m_disassembler->disassemble(static_cast<uint32_t>(target_va - image_base));
+        const auto disassembled = m_disassembler->disassemble(static_cast<uint32_t>(
+            target_va - image_base), 1500);
 
         if (!disassembled) {
             continue;
@@ -652,52 +731,7 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
             continue;
         }
 
-        bool preserved_flags = false, has_flags_changed = false;
-
-        // track function progressively to find if it pushes flags onto the stack before modifying any
-        // and then acquires the lock to classify it as vm entry
-        std::optional next_bb_id = disassembled->m_first_bb_id;
-
-        while (next_bb_id.has_value()) {
-            const auto &bb = disassembled->m_basic_blocks.at(next_bb_id.value());
-
-            if (preserved_flags) {
-                break;
-            }
-
-            // iterate over all instructions of basic block
-            for (const auto &instr: bb.m_instructions) {
-                // check if current instruction changes the flags
-                if (const auto flags = instr.m_instruction.cpu_flags) {
-                    if ((flags->modified | flags->set_0 | flags->set_1 | flags->undefined) != 0) {
-                        has_flags_changed = true;
-                    }
-                }
-
-                // check if current instruction preserves the flags
-                if (instr.m_instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFQ || instr.m_instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFD) {
-                    preserved_flags = !has_flags_changed;
-                    break;
-                }
-
-                if (!preserved_flags && has_flags_changed) {
-                    break;
-                }
-            }
-
-            // if flags have changed but haven't been preserved, this function can't be vm entry
-            if (has_flags_changed && !preserved_flags) {
-                break;
-            }
-
-            if (bb.m_successors.size() != 1) {
-                break;
-            }
-
-            next_bb_id = {bb.m_successors.back()};
-        }
-
-        if (!preserved_flags) {
+        if (!preserves_entry_flags(*disassembled)) {
             continue;
         }
 
@@ -739,7 +773,8 @@ void c_themida_unpacker::find_vm_trampolines(const uint64_t base_address, const 
         for (const auto bb_id : disassembled->m_final_block_ids) {
             const auto &bb = disassembled->m_basic_blocks.at(bb_id);
 
-            if (bb.m_instructions.size() < 2 || ((bb.m_instructions.rbegin() + 1)->m_instruction.mnemonic != ZYDIS_MNEMONIC_POPFQ &&
+            if (bb.m_instructions.size() < 2 || bb.m_instructions.back().m_instruction.mnemonic != ZYDIS_MNEMONIC_RET ||
+                ((bb.m_instructions.rbegin() + 1)->m_instruction.mnemonic != ZYDIS_MNEMONIC_POPFQ &&
                 (bb.m_instructions.rbegin() + 1)->m_instruction.mnemonic != ZYDIS_MNEMONIC_POPFD)) {
                 continue;
             }

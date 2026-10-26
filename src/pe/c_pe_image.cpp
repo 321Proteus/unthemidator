@@ -23,11 +23,11 @@ uint32_t c_pe_image::get_size_of_headers() const {
     return m_size_of_headers;
 }
 
-std::vector<uint8_t> c_pe_image::get_original_mapping() const {
+const std::vector<uint8_t>& c_pe_image::get_original_mapping() const {
     return m_file_binary;
 }
 
-std::vector<uint8_t> c_pe_image::get_mapped_image() const {
+const std::vector<uint8_t>& c_pe_image::get_mapped_image() const {
     return m_mapped_binary;
 }
 
@@ -51,7 +51,7 @@ bool c_pe_image::is_rva_in_executable_section(const uint64_t address) const {
     return false;
 }
 
-std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> c_pe_image::get_imports() const {
+const std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>>& c_pe_image::get_imports() const {
     return m_imports;
 }
 

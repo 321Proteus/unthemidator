@@ -8,6 +8,7 @@
 
 class c_pe_image;
 class c_memory_manager;
+class c_emulator_ctx;
 
 class c_pe_builder {
 public:
@@ -18,12 +19,12 @@ public:
 
     void set_loader_shellcode(const std::vector<uint8_t> &shellcode);
 
-    void build();
+    void build(const c_emulator_ctx& ctx);
 
-    [[nodiscard]] std::vector<uint8_t> get_built_pe() const;
+    [[nodiscard]] const std::vector<uint8_t>& get_built_pe() const;
 private:
     void rename_sections();
-    void clear_original_imports(std::vector<uint8_t> &mapped_image) const;
+    void update_original_imports(std::vector<uint8_t> &mapped_image, bool restore) const;
     void build_import_descriptor();
     void build_tls();
 
