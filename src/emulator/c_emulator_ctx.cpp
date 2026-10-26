@@ -24,8 +24,18 @@ static void mem_callback(uc_engine *uc, const uc_mem_type type, const uint64_t a
     (*static_cast<std::function<mem_callback_t>*>(cb))(uc, type, address, size, value);
 }
 
-static bool mem_prot_callback(uc_engine*, const uc_mem_type, const uint64_t, const int, const int64_t, void*) {
-    return true;
+static bool mem_fault_callback(uc_engine *uc, const uc_mem_type type, const uint64_t address,
+    const int size, const int64_t value, void* cb) {
+    mem_callback(uc, type, address, size, value, cb);
+    return false; // The observer does not repair the faulting mapping.
+}
+
+static bool mem_prot_callback(uc_engine*, const uc_mem_type, const uint64_t address, const int size, const int64_t, void*) {
+    return !c_memory::overlaps_shared_data(address, static_cast<uint64_t>(size));
+}
+
+static void shared_data_callback(uc_engine*, uc_mem_type, uint64_t, int, int64_t, const c_memory* memory) {
+    (void)memory->get_shared_data();
 }
 
 static int cpuid_callback(uc_engine *uc, void*) {
@@ -81,8 +91,7 @@ static bool dispatch_hook(uc_engine *uc, const uint64_t address, c_emulator_ctx*
     const auto hook = ctx->get_hook(address);
 
     if (ctx->get_themida_unpacker() && ctx->get_themida_unpacker()->should_stop(address)) {
-        ctx->set_pc(address);
-        uc_emu_stop(uc);
+        ctx->stop(address);
 
         return false;
     }
@@ -101,7 +110,14 @@ static bool dispatch_hook(uc_engine *uc, const uint64_t address, c_emulator_ctx*
     //printf("[+] calling %s from 0x%llX, ret addr 0x%llX...\n", hook->m_name.c_str(), address, ret_addr);
 
     const auto arg_count = hook->m_arg_count;
+    // Both INT3 and protected-fetch hooks see the actual hooked address.
+    ctx->set_pc(address);
     hook->m_function(ctx);
+
+    if (ctx->is_stopped()) {
+        uc_emu_stop(uc);
+        return false;
+    }
 
     // adjust SP as if a RET has been made
     sp += is_x86 ? sizeof(uint32_t) * (1ULL + arg_count) : sizeof(uint64_t);
@@ -123,14 +139,20 @@ static void int_callback(uc_engine *uc, const int exception, c_emulator_ctx* ctx
     dispatch_hook(uc, int3_addr, ctx);
 }
 
+static void syscall_callback(uc_engine *uc, void*) {
+    throw std::runtime_error("syscall callback!"); // fixme
+}
+
 bool c_emulator_ctx::fetch_prot_callback(uc_engine *uc, uc_mem_type, const uint64_t address, int, int64_t, c_emulator_ctx* ctx) {
-    if (!ctx->get_hook(address)) {
+    if (!ctx->get_hook(address) &&
+        !(ctx->get_themida_unpacker() && ctx->get_themida_unpacker()->should_stop(address))) {
         return false;
     }
 
     if (dispatch_hook(uc, address, ctx)) {
         ctx->m_hook_resume = ctx->get_pc();
     }
+
     uc_emu_stop(uc);
     return false;
 }
@@ -146,10 +168,12 @@ c_emulator_ctx::c_emulator_ctx(c_emulator* emulator, uc_engine *uc, const std::s
     }
 
     // setup cpuid hook
-    {
-        uc_hook_add(m_uc, &m_cpuid_trace, UC_HOOK_INSN, reinterpret_cast<void*>(cpuid_callback),
-            nullptr, 1, 0, UC_X86_INS_CPUID);
-    }
+    uc_hook_add(m_uc, &m_cpuid_trace, UC_HOOK_INSN, reinterpret_cast<void*>(cpuid_callback),
+        nullptr, 1, 0, UC_X86_INS_CPUID);
+
+    // setup syscall hook
+    uc_hook_add(m_uc, &m_syscall_trace, UC_HOOK_INSN, reinterpret_cast<void*>(syscall_callback),
+        nullptr, 1, 0, UC_X86_INS_SYSCALL);
 
     uc_hook_add(m_uc, &m_fetch_trace, UC_HOOK_MEM_FETCH_PROT, reinterpret_cast<void*>(fetch_prot_callback),
         this, 1, 0);
@@ -158,13 +182,22 @@ c_emulator_ctx::c_emulator_ctx(c_emulator* emulator, uc_engine *uc, const std::s
         reinterpret_cast<void*>(mem_prot_callback), nullptr, 1, 0);
 
     m_imports = std::make_shared<c_imports>(this);
+
+    if (uc_hook_add(m_uc, &m_shared_data_trace, UC_HOOK_MEM_READ,
+        reinterpret_cast<void*>(shared_data_callback), m_memory_manager.get(),
+        c_memory::k_shared_data_base, c_memory::k_shared_data_base + c_memory::k_shared_data_size - 1) != UC_ERR_OK) {
+        //
+        throw std::runtime_error("emulator ctx: failed to hook KUSER_SHARED_DATA reads");
+    }
 }
 
 c_emulator_ctx::~c_emulator_ctx() {
+    uc_hook_del(m_uc, m_shared_data_trace);
     uc_hook_del(m_uc, m_int_trace);
     uc_hook_del(m_uc, m_fetch_trace);
     uc_hook_del(m_uc, m_prot_trace);
     uc_hook_del(m_uc, m_cpuid_trace);
+    uc_hook_del(m_uc, m_syscall_trace);
 
     uc_close(m_uc);
 }
@@ -213,8 +246,9 @@ uint64_t c_emulator_ctx::get_arg(const uint32_t index) const {
         return read<uint32_t>(get_x86_reg_value(UC_X86_REG_ESP) + 4ULL * (index + 1ULL)).value();
     }
 
-    constexpr std::array regs = { UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9 };
-    if (index < regs.size()) {
+    if (constexpr std::array regs = { UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9 };
+        index < regs.size()) {
+        //
         return get_x86_reg_value(regs[index]);
     }
 
@@ -223,14 +257,18 @@ uint64_t c_emulator_ctx::get_arg(const uint32_t index) const {
 
 void c_emulator_ctx::set_arg(const uint32_t index, const uint64_t value) const {
     if (get_arch() == e_architecture::k_x86) {
-        if (!write<uint32_t>(get_x86_reg_value(UC_X86_REG_ESP) + 4ULL * (index + 1ULL), static_cast<uint32_t>(value))) {
+        if (!write<uint32_t>(get_x86_reg_value(UC_X86_REG_ESP) + 4ULL * (index + 1ULL),
+            static_cast<uint32_t>(value))) {
+            //
             throw std::runtime_error("emulator ctx: failed to write argument");
         }
+
         return;
     }
 
-    constexpr std::array regs = { UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9 };
-    if (index < regs.size()) {
+    if (constexpr std::array regs = { UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_R8, UC_X86_REG_R9 };
+        index < regs.size()) {
+        //
         set_x86_reg_value(regs[index], value);
         return;
     }
@@ -266,7 +304,9 @@ void c_emulator_ctx::add_mem_hook(const uc_hook_type hook_type, std::function<me
         .m_hook = std::move(callback),
     };
 
-    uc_hook_add(m_uc, &m_mem_hooks.at(start_address).m_trace, hook_type, reinterpret_cast<void*>(mem_callback),
+    const auto trampoline = hook_type & UC_HOOK_MEM_INVALID ?
+        reinterpret_cast<void*>(mem_fault_callback) : reinterpret_cast<void*>(mem_callback);
+    uc_hook_add(m_uc, &m_mem_hooks.at(start_address).m_trace, hook_type, trampoline,
         reinterpret_cast<void*>(&m_mem_hooks.at(start_address).m_hook), start_address, end_address);
 }
 
@@ -419,6 +459,17 @@ void c_emulator_ctx::raise_exception(const uint32_t exception_code) {
                 throw std::runtime_error("exception handler failed to return");
             }
 
+            if (m_stop_requested) {
+                const auto stopped_pc = get_pc();
+
+                if (uc_context_restore(m_uc, saved) != UC_ERR_OK) {
+                    throw std::runtime_error("failed to restore exception context");
+                }
+
+                stop(stopped_pc);
+                return;
+            }
+
             if (static_cast<int32_t>(get_x86_reg_value(UC_X86_REG_EAX)) != -1) {
                 continue;
             }
@@ -479,9 +530,70 @@ void c_emulator_ctx::raise_exception(const uint32_t exception_code) {
     }
 }
 
+void c_emulator_ctx::run_thread(const uint64_t address, const uint64_t end, const uint64_t param) const {
+    uc_context *saved = nullptr;
+
+    if (uc_context_alloc(m_uc, &saved) != UC_ERR_OK) {
+        throw std::runtime_error("failed to allocate thread context");
+    }
+
+    const std::unique_ptr<uc_context, decltype(&uc_context_free)> original(saved, uc_context_free);
+    if (uc_context_save(m_uc, saved) != UC_ERR_OK) {
+        throw std::runtime_error("failed to save thread context");
+    }
+
+    constexpr uint32_t k_stack_size = 0x10000;
+
+    const auto stack = allocate_storage(k_stack_size);
+    const auto hook_resume = m_hook_resume;
+    const auto is_x86 = get_arch() == e_architecture::k_x86;
+    const auto sp = stack + k_stack_size - (is_x86 ? 8 : 0x28);
+
+    try {
+        set_x86_reg_value(is_x86 ? UC_X86_REG_ESP : UC_X86_REG_RSP, sp);
+        set_arg(0, param);
+        set_pc(address);
+
+        if (const auto err = emulate(address, end, 0); err != UC_ERR_OK) {
+            throw std::runtime_error("thread emulation failed: " + std::to_string(err));
+        }
+
+        if (!m_stop_requested && get_pc() != end) {
+            throw std::runtime_error("thread emulation stopped before its end address");
+        }
+    } catch (...) {
+        m_hook_resume = hook_resume;
+
+        uc_context_restore(m_uc, saved);
+        uc_mem_unmap(m_uc, stack, k_stack_size);
+
+        throw;
+    }
+
+    const auto stopped_pc = get_pc();
+
+    m_hook_resume = m_stop_requested ? std::nullopt : hook_resume;
+
+    const auto err = uc_context_restore(m_uc, saved);
+    uc_mem_unmap(m_uc, stack, k_stack_size);
+
+    if (err != UC_ERR_OK) {
+        throw std::runtime_error("failed to restore original context");
+    }
+
+    if (m_stop_requested) {
+        stop(stopped_pc);
+    }
+}
+
 uint64_t c_emulator_ctx::create_process_snapshot(const uint32_t flags, const uint32_t process_id) const {
     const auto handle = m_next_snapshot_handle++;
-    m_process_snapshots.emplace(handle, s_process_snapshot{ flags, process_id });
+
+    m_process_snapshots.emplace(handle, s_process_snapshot{
+        .m_flags = flags,
+        .m_process_id = process_id,
+    });
+
     return handle;
 }
 
@@ -523,16 +635,46 @@ uint64_t c_emulator_ctx::map_dummy_module(const std::vector<uint8_t> &image, con
     return image_base;
 }
 
+void c_emulator_ctx::stop(const uint64_t address) const {
+    m_stop_requested = true;
+    m_hook_resume.reset();
+
+    set_pc(address);
+    uc_emu_stop(m_uc);
+}
+
 uc_err c_emulator_ctx::emulate(uint64_t start, const uint64_t end, const size_t count) const {
+    if (!m_emulation_depth) {
+        m_stop_requested = false;
+    }
+
+    struct s_depth_guard {
+        size_t& depth;
+        explicit s_depth_guard(size_t& value) : depth(value) { ++depth; }
+        ~s_depth_guard() { --depth; }
+    } guard(m_emulation_depth);
+
     for (;;) {
+        if (m_stop_requested) {
+            return UC_ERR_OK;
+        }
+
         m_hook_resume.reset();
+
         const auto err = uc_emu_start(m_uc, start, end, 0, count);
+
+        if (m_stop_requested) {
+            m_hook_resume.reset();
+            return err == UC_ERR_FETCH_PROT ? UC_ERR_OK : err;
+        }
+
         if (!m_hook_resume || (err != UC_ERR_OK && err != UC_ERR_FETCH_PROT)) {
             return err;
         }
 
         start = *m_hook_resume;
         set_pc(start);
+
         if (count == 1 || (end && start == end)) {
             return UC_ERR_OK;
         }
@@ -594,15 +736,13 @@ void c_emulator_ctx::run(const uint64_t start, const uint64_t end, std::function
 
     err = emulate(start, end, 0);
 
-    if (err != UC_ERR_OK && err != UC_ERR_FETCH_PROT) {
+    if (err != UC_ERR_OK /*&& err != UC_ERR_FETCH_PROT*/) {
         /*
         printf("failed at 0x%llX , rsi - 0x%llX , rdi - 0x%llX , rax - 0x%llX , rbx - 0x%llX , r10 - 0x%llX, rbp - 0x%llX, r15 - 0x%llX, rcx - 0x%llX, r12 - 0x%llX\n",
             get_pc(),
             get_x86_reg_value(UC_X86_REG_RSI), get_x86_reg_value(UC_X86_REG_RDI), get_x86_reg_value(UC_X86_REG_RAX),
             get_x86_reg_value(UC_X86_REG_RBX), get_x86_reg_value(UC_X86_REG_R10), get_x86_reg_value(UC_X86_REG_RBP),
-            get_x86_reg_value(UC_X86_REG_R15), get_x86_reg_value(UC_X86_REG_RCX), get_x86_reg_value(UC_X86_REG_R12));
-        */
-
+            get_x86_reg_value(UC_X86_REG_R15), get_x86_reg_value(UC_X86_REG_RCX), get_x86_reg_value(UC_X86_REG_R12)); */
         throw std::runtime_error("emulation error: " + std::to_string(err));
     }
 
@@ -817,7 +957,7 @@ void c_emulator_ctx::initialize_windows_ldr() const {
         const uint64_t head = ldr_base + k_ldr_list_offsets[i];
         const uint64_t node = entry_base + k_entry_list_offsets[i];
 
-        // LIST_ENTRY.Flink / LIST_ENTRY.Blink.
+        // LIST_ENTRY.Flink / LIST_ENTRY.Blink
         set_ptr(k_entry_list_offsets[i], head);
         set_ptr(k_entry_list_offsets[i] + ptr_size, head);
     }
@@ -832,20 +972,20 @@ void c_emulator_ctx::initialize_windows_ldr() const {
     set_unicode_string(is_x86 ? 0x2C : 0x58, k_base_name_offset,
         k_base_name, sizeof(k_base_name));
 
-    // Map and populate LDR_DATA_TABLE_ENTRY and both Unicode strings.
+    // Map and populate LDR_DATA_TABLE_ENTRY and both Unicode strings
     if (uc_mem_map(uc, entry_base, k_page_size, UC_PROT_READ | UC_PROT_WRITE) != UC_ERR_OK) {
         throw std::runtime_error("failed to map LDR entry");
     }
 
     write(entry_base, entry.data(), entry.size());
 
-    // Initialize PEB_LDR_DATA fields.
+    // Initialize PEB_LDR_DATA fields
     write32(ldr_base + 0x00, is_x86 ? 0x30 : 0x58);
 
     constexpr uint8_t initialized = 1;
     write(ldr_base + 0x04, &initialized, sizeof(initialized));
 
-    // Link all three lists to the single entry.
+    // Link all three lists to the single entry
     for (size_t i = 0; i < k_ldr_list_offsets.size(); ++i) {
         const uint64_t head = ldr_base + k_ldr_list_offsets[i];
         const uint64_t node = entry_base + k_entry_list_offsets[i];

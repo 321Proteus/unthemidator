@@ -19,8 +19,8 @@ uint64_t c_imports::load_module(std::string module_name) {
         return std::tolower(c);
     });
 
-    if (m_module_addresses.contains(module_name)) {
-        return m_module_addresses.at(module_name);
+    if (const auto module = m_module_addresses.find(module_name); module != m_module_addresses.end()) {
+        return module->second;
     }
 
     std::shared_ptr<c_pe_image> pe_image = nullptr;
@@ -47,8 +47,10 @@ uint64_t c_imports::load_module(std::string module_name) {
 
         // manually parse exports if the record in catalog DOES exist
         if (catalog.contains("modules") && catalog.at("modules").contains(module_name)) {
-            for (const auto &pe_export : catalog.at("modules").at(module_name).at(
-                "exports").get<nlohmann::json::array_t>()) {
+            const auto &catalog_exports = catalog.at("modules").at(module_name).at(
+                "exports").get_ref<const nlohmann::json::array_t&>();
+            exports.reserve(catalog_exports.size());
+            for (const auto &pe_export : catalog_exports) {
                 //
                 exports.push_back(s_dummy_export{
                     .m_name = pe_export.at("name").is_string() ? pe_export.at("name").get<std::string>() :
@@ -68,6 +70,7 @@ uint64_t c_imports::load_module(std::string module_name) {
     uint64_t original_image_base = 0x1000000;
 
     if (pe_image) {
+        exports.reserve(pe_image->get_exports().size());
         for (const auto &pe_export : pe_image->get_exports()) {
             exports.push_back(s_dummy_export{
                 .m_name = pe_export.m_name,
@@ -116,26 +119,35 @@ uint64_t c_imports::load_module(std::string module_name) {
     m_module_addresses.emplace(module_name, image_base);
     m_modules.emplace(image_base, module_name);
     m_exports_by_name.emplace(module_name, std::unordered_map<std::string, s_dummy_export>{});
+    auto &module_exports = m_exports_by_name.at(module_name);
+    module_exports.reserve(exports.size());
 
     // save all export addresses
     for (auto &pe_export : exports) {
         pe_export.m_entry_address += image_base;
 
-        m_exports_by_name.at(module_name).emplace(pe_export.m_name, pe_export);
+        module_exports.emplace(pe_export.m_name, pe_export);
         m_exports_by_va.emplace(pe_export.m_entry_address, std::make_pair(module_name, pe_export.m_name));
 
-        //printf("0x%llX - %s %s\n", pe_export.m_entry_address, module_name.c_str(), pe_export.m_name.c_str());
+        /*
+        if (module_name.find("ucrt") != std::string::npos || module_name.find("api-") != std::string::npos ||
+            module_name.find("msvc") != std::string::npos) {
+            continue;
+        }
+
+        printf("0x%llX - %s %s\n", pe_export.m_entry_address, module_name.c_str(), pe_export.m_name.c_str());*/
     }
 
     return image_base;
 }
 
 uint64_t c_imports::resolve_import(const uint64_t module_base, const std::string &function_name) const {
-    if (!m_modules.contains(module_base)) {
+    const auto module = m_modules.find(module_base);
+    if (module == m_modules.end()) {
         return 0;
     }
 
-    const auto &mod_exports = m_exports_by_name.at(m_modules.at(module_base));
+    const auto &mod_exports = m_exports_by_name.at(module->second);
     const auto it_export = mod_exports.find(function_name);
 
     if (it_export == mod_exports.end()) {
@@ -145,11 +157,27 @@ uint64_t c_imports::resolve_import(const uint64_t module_base, const std::string
     return it_export->second.m_entry_address;
 }
 
+uint64_t c_imports::resolve_import(const uint64_t module_base, const uint16_t ordinal) const {
+    const auto module = m_modules.find(module_base);
+    if (module == m_modules.end()) {
+        return 0;
+    }
+
+    for (const auto &[name, entry] : m_exports_by_name.at(module->second)) {
+        if (entry.m_ordinal == ordinal) {
+            return entry.m_entry_address;
+        }
+    }
+
+    return 0;
+}
+
 const s_dummy_export * c_imports::find_import_by_address(const uint64_t address) {
-    if (!m_exports_by_va.contains(address)) {
+    const auto entry = m_exports_by_va.find(address);
+    if (entry == m_exports_by_va.end()) {
         return nullptr;
     }
 
-    const auto &[mod_name, fn_name] = m_exports_by_va.at(address);
+    const auto &[mod_name, fn_name] = entry->second;
     return &m_exports_by_name.at(mod_name).at(fn_name);
 }

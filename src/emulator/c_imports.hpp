@@ -12,6 +12,7 @@ public:
 
     uint64_t load_module(std::string module_name);
     [[nodiscard]] uint64_t resolve_import(uint64_t module_base, const std::string &function_name) const;
+    [[nodiscard]] uint64_t resolve_import(uint64_t module_base, uint16_t ordinal) const;
 
     const s_dummy_export * find_import_by_address(uint64_t address);
 private:

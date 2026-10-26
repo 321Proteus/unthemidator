@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "../helpers/common.hpp"
+#include "../memory/c_memory.hpp"
 #include "c_imports.hpp"
 
 using code_callback_t = void(uc_engine *uc, uint64_t address, uint32_t size);
@@ -66,6 +67,7 @@ public:
     void add_exception_handler(uint64_t address);
     void remove_exception_handler(uint64_t address);
     void raise_exception(uint32_t exception_code);
+    void run_thread(uint64_t address, uint64_t end, uint64_t param) const;
 
     const s_hooked_function* get_hook(uint64_t address);
 
@@ -76,6 +78,9 @@ public:
         static_assert(std::is_trivially_copyable_v<T>, "read<T> requires a trivially copyable type");
 
         T value{};
+        if (c_memory::overlaps_shared_data(address, sizeof(T))) {
+            (void)get_memory()->get_shared_data();
+        }
         if (uc_mem_read(m_uc, address, &value, sizeof(T)) != UC_ERR_OK) {
             return std::nullopt;
         }
@@ -87,6 +92,10 @@ public:
     [[nodiscard]] bool write(const uint64_t address, T value) const {
         static_assert(std::is_trivially_copyable_v<T>, "write<T> requires a trivially copyable type");
 
+        if (c_memory::overlaps_shared_data(address, sizeof(T))) {
+            return false;
+        }
+
         if (uc_mem_write(m_uc, address, &value, sizeof(T)) != UC_ERR_OK) {
             return false;
         }
@@ -95,6 +104,8 @@ public:
     }
 
     void single_step(std::function<mem_callback_t> on_mem = nullptr) const;
+    void stop(uint64_t address) const;
+    [[nodiscard]] bool is_stopped() const { return m_stop_requested; }
     void run(uint64_t start, uint64_t end = 0, std::function<code_callback_t> on_code = nullptr,
         std::function<mem_callback_t> on_mem = nullptr) const;
 
@@ -109,11 +120,14 @@ private:
     uc_err emulate(uint64_t start, uint64_t end, size_t count) const;
 
     mutable std::optional<uint64_t> m_hook_resume;
+    mutable bool m_stop_requested = false;
+    mutable size_t m_emulation_depth = 0;
 
     uc_engine *m_uc;
     c_emulator *m_emulator;
 
-    uc_hook m_int_trace{}, m_cpuid_trace{}, m_fetch_trace{}, m_prot_trace{};
+    uc_hook m_int_trace{}, m_cpuid_trace{}, m_fetch_trace{}, m_prot_trace{}, m_syscall_trace{};
+    uc_hook m_shared_data_trace{};
 
     std::shared_ptr<c_memory_manager> m_memory_manager;
     std::shared_ptr<c_imports> m_imports;

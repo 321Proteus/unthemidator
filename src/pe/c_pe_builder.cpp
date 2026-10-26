@@ -5,11 +5,11 @@
 #include <stdexcept>
 #include <vector>
 #include <cstring>
-#include <cstdio>
 
 #include "pe_structs.hpp"
 #include "c_pe_image.hpp"
 #include "../memory/c_memory_manager.hpp"
+#include "../emulator/c_emulator_ctx.hpp"
 
 #undef min
 #undef max
@@ -64,8 +64,24 @@ void c_pe_builder::set_loader_shellcode(const std::vector<uint8_t> &shellcode) {
     m_loader_shellcode = shellcode;
 }
 
-void c_pe_builder::build() {
+void c_pe_builder::build(const c_emulator_ctx& ctx) {
     auto mapped_image = m_memory_manager->get_mapped_image();
+    // Locate the live resource entry using trusted headers, never the potentially
+    // damaged DOS/NT/optional headers in Unicorn. Only this 8-byte entry is read.
+    const auto &original = m_pe_image->get_mapped_image();
+    const auto original_dos = read_at<s_dos_header>(original, 0);
+    const auto original_optional = static_cast<size_t>(original_dos.e_lfanew) +
+        sizeof(uint32_t) + sizeof(s_coff_header);
+    const auto directories_offset = m_pe_image->is_x64() ? offsetof(s_optional_header_64, data_directory) :
+        offsetof(s_optional_header_32, data_directory);
+    const auto resource_offset = original_optional + directories_offset +
+        k_directory_entry_resource * sizeof(s_data_directory);
+    (void)read_at<s_data_directory>(original, resource_offset);
+    const auto resource = ctx.read<s_data_directory>(m_pe_image->get_image_base() + resource_offset);
+    if (!resource) {
+        throw std::runtime_error("pe builder: failed to read live resource directory");
+    }
+    write_at(mapped_image, resource_offset, *resource);
     const auto dos = read_at<s_dos_header>(mapped_image, 0);
 
     if (dos.e_magic != k_dos_magic) {
@@ -102,9 +118,7 @@ void c_pe_builder::build() {
         throw std::runtime_error("pe builder: truncated PE headers");
     }
 
-    if (!m_imports.empty()) {
-        clear_original_imports(mapped_image);
-    }
+    update_original_imports(mapped_image, m_imports.empty());
 
     m_built_file = std::vector<uint8_t>(headers_size, 0);
     std::memcpy(m_built_file.data(), mapped_image.data(), headers_size);
@@ -196,7 +210,7 @@ void c_pe_builder::build() {
     write_at<uint16_t>(m_built_file, optional_offset + offsetof(s_optional_header_32, dll_characteristics), dll_flags & ~0x60);
 }
 
-std::vector<uint8_t> c_pe_builder::get_built_pe() const {
+const std::vector<uint8_t>& c_pe_builder::get_built_pe() const {
     return m_built_file;
 }
 
@@ -240,7 +254,7 @@ void c_pe_builder::rename_sections() {
                 continue;
             }
 
-            static constexpr std::string old_idata = ".old";
+            const std::string old_idata = ".old";
 
             memset(section.name, 0, sizeof(section.name));
             std::memcpy(section.name, old_idata.c_str(), old_idata.length());
@@ -286,8 +300,8 @@ void c_pe_builder::rename_sections() {
     }
 }
 
-void c_pe_builder::clear_original_imports(std::vector<uint8_t> &mapped_image) const {
-    const auto original = m_pe_image->get_mapped_image();
+void c_pe_builder::update_original_imports(std::vector<uint8_t> &mapped_image, const bool restore) const {
+    const auto &original = m_pe_image->get_mapped_image();
     const auto dos = read_at<s_dos_header>(original, 0);
     const auto optional_offset = static_cast<size_t>(dos.e_lfanew) + sizeof(uint32_t) + sizeof(s_coff_header);
     const auto is_x64 = m_pe_image->is_x64();
@@ -296,6 +310,13 @@ void c_pe_builder::clear_original_imports(std::vector<uint8_t> &mapped_image) co
     const auto directory = read_at<s_data_directory>(original,
         optional_offset + directories_offset + k_directory_entry_import * sizeof(s_data_directory));
 
+    if (restore) {
+        for (const auto index : { k_directory_entry_import, k_directory_entry_iat, k_directory_entry_bound_import }) {
+            const auto offset = optional_offset + directories_offset + index * sizeof(s_data_directory);
+            write_at(mapped_image, offset, read_at<s_data_directory>(original, offset));
+        }
+    }
+
     if (!directory.virtual_address) {
         return;
     }
@@ -303,15 +324,20 @@ void c_pe_builder::clear_original_imports(std::vector<uint8_t> &mapped_image) co
     const uint32_t ptr_size = is_x64 ? 8 : 4;
     const uint64_t ordinal_flag = is_x64 ? k_ordinal_flag_64 : k_ordinal_flag_32;
 
-    const auto clear = [&](const size_t offset, const size_t size) {
-        if (offset > mapped_image.size() || size > mapped_image.size() - offset) {
+    const auto update = [&](const size_t offset, const size_t size) {
+        if (offset > mapped_image.size() || size > mapped_image.size() - offset ||
+            offset > original.size() || size > original.size() - offset) {
             throw std::runtime_error("pe builder: original import outside mapped image");
         }
 
-        memset(mapped_image.data() + offset, 0, size);
+        if (restore) {
+            memcpy(mapped_image.data() + offset, original.data() + offset, size);
+        } else {
+            memset(mapped_image.data() + offset, 0, size);
+        }
     };
 
-    const auto clear_name = [&](const size_t offset, const size_t prefix) {
+    const auto update_name = [&](const size_t offset, const size_t prefix) {
         if (offset >= original.size() || prefix >= original.size() - offset) {
             throw std::runtime_error("pe builder: invalid original import name");
         }
@@ -323,34 +349,41 @@ void c_pe_builder::clear_original_imports(std::vector<uint8_t> &mapped_image) co
             throw std::runtime_error("pe builder: unterminated original import name");
         }
 
-        clear(offset, prefix + static_cast<size_t>(end - name) + 1);
+        update(offset, prefix + static_cast<size_t>(end - name) + 1);
     };
 
     for (size_t offset = directory.virtual_address;; offset += sizeof(s_import_descriptor)) {
         const auto descriptor = read_at<s_import_descriptor>(original, offset);
 
         if (!descriptor.name) {
-            clear(offset, sizeof(descriptor));
+            update(offset, sizeof(descriptor));
             break;
         }
 
-        clear_name(descriptor.name, 0);
+        update_name(descriptor.name, 0);
 
         const auto lookup_rva = descriptor.original_first_thunk ? descriptor.original_first_thunk : descriptor.first_thunk;
         if (lookup_rva) {
             for (size_t thunk = lookup_rva;; thunk += ptr_size) {
                 const auto value = is_x64 ? read_at<uint64_t>(original, thunk) : read_at<uint32_t>(original, thunk);
 
+                if (restore) {
+                    update(thunk, ptr_size);
+                    if (descriptor.first_thunk) {
+                        update(static_cast<size_t>(descriptor.first_thunk) + thunk - lookup_rva, ptr_size);
+                    }
+                }
+
                 if (!value) {
                     break;
                 }
                 if (!(value & ordinal_flag)) {
-                    clear_name(value, sizeof(uint16_t));
+                    update_name(value, sizeof(uint16_t));
                 }
             }
         }
 
-        clear(offset, sizeof(descriptor));
+        update(offset, sizeof(descriptor));
     }
 }
 
@@ -535,7 +568,7 @@ void c_pe_builder::build_tls() {
     const uint32_t directory_size = 4 * ptr_size + 8;
 
     const auto image_base = m_pe_image->get_image_base();
-    const auto mapped = m_memory_manager->get_mapped_image();
+    const auto &mapped = m_memory_manager->get_mapped_image();
 
     const auto dos = read_at<s_dos_header>(mapped, 0);
     const auto optional_offset = static_cast<size_t>(dos.e_lfanew) + sizeof(uint32_t) + sizeof(s_coff_header);
@@ -866,7 +899,7 @@ void c_pe_builder::set_data_directory(const uint32_t index, const uint32_t rva, 
     const auto number_of_directories = read_at<uint32_t>(
         m_built_file, optional_offset + count_offset);
 
-    if (index >= number_of_directories || static_cast<uint64_t>(directory_offset) + (static_cast<uint64_t>(index) + 1) *
+    if (index >= number_of_directories || directory_offset + (static_cast<uint64_t>(index) + 1) *
         sizeof(s_data_directory) > coff.size_of_optional_header) {
         //
         throw std::runtime_error("pe builder: data directory index out of range");
@@ -877,12 +910,5 @@ void c_pe_builder::set_data_directory(const uint32_t index, const uint32_t rva, 
     directory.size = size;
 
     const auto offset = optional_offset + directory_offset + index * sizeof(s_data_directory);
-
-    if (index == k_directory_entry_iat) {
-        const auto old_directory = read_at<s_data_directory>(m_built_file, offset);
-        printf("[pe builder] IAT directory: old RVA 0x%X, size 0x%X -> new RVA 0x%X, size 0x%X\n",
-            old_directory.virtual_address, old_directory.size, rva, size);
-    }
-
     write_at(m_built_file, offset, directory);
 }

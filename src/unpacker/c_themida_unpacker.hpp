@@ -20,7 +20,7 @@ public:
     void decompress_vms();
 
     [[nodiscard]] uint32_t get_oep_rva() const;
-    [[nodiscard]] std::vector<s_themida_recovered_import> get_recovered_imports() const;
+    [[nodiscard]] const std::vector<s_themida_recovered_import>& get_recovered_imports() const;
     [[nodiscard]] const std::vector<s_themida_vm_trampoline>& get_vm_trampolines() const { return m_vm_trampolines; }
 
     [[nodiscard]] const std::vector<uint8_t>& get_loader_shellcode() const;
@@ -31,8 +31,10 @@ public:
     void on_region_save(uint64_t address, uint32_t size);
     void on_region_made_writable(uint64_t address, uint32_t size);
     void on_first_vm_enter(uint64_t address);
+    void on_thread_create(uint64_t address, uint64_t param) const;
     [[nodiscard]] bool should_stop(uint64_t address) const;
 private:
+    [[nodiscard]] static bool preserves_entry_flags(const c_intel_function &function);
     [[nodiscard]] bool is_vm_enter(uint64_t address, std::shared_ptr<c_intel_function> disassembled);
     [[nodiscard]] bool may_be_vm_enter(uint64_t address) const;
     [[nodiscard]] std::shared_ptr<s_themida_vm_handler> discover_vm_handler(uint64_t address);

@@ -11,21 +11,30 @@ c_memory_manager::c_memory_manager(const std::shared_ptr<c_pe_image>& pe_image) 
 
 uint64_t c_memory_manager::allocate_helper_stub(const uint32_t size) {
     // allocate stub on top of the existing dump
-    const auto stub_address = m_cursor;
+    auto stub_address = m_cursor;
 
-    const auto next_cursor = page_up(m_cursor + size + 0x100, 0x1000);
+    auto next_cursor = page_up(stub_address + size + 0x100, 0x1000);
+    if (overlaps_shared_data(stub_address, next_cursor - stub_address)) {
+        stub_address = k_shared_data_base + k_shared_data_size;
+        next_cursor = page_up(stub_address + size + 0x100, 0x1000);
+    }
 
     if (!m_pe_image->is_x64() && next_cursor > UINT32_MAX) {
         throw std::runtime_error("memory: x86 allocation exceeds 32-bit address space");
     }
 
+    // Keep address-based offsets intact across the reserved hole.
+    m_commited_memory.resize(next_cursor - m_commited_memory_start, 0);
     m_cursor = next_cursor;
-    m_commited_memory.insert(m_commited_memory.end(), m_cursor - stub_address, 0);
 
     return stub_address;
 }
 
 void c_memory_manager::write_memory(const uint64_t address, const std::vector<uint8_t> &dump) {
+    if (overlaps_shared_data(address, dump.size())) {
+        throw std::runtime_error("memory: KUSER_SHARED_DATA is read-only");
+    }
+
     if (address + dump.size() > m_cursor) {
         throw std::runtime_error("memory: attempted out of range write");
     }

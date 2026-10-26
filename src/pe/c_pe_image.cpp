@@ -52,7 +52,7 @@ bool c_pe_image::is_rva_in_executable_section(const uint64_t address) const {
     return false;
 }
 
-std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> c_pe_image::get_imports() const {
+const std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>>& c_pe_image::get_imports() const {
     return m_imports;
 }
 

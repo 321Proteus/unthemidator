@@ -12,7 +12,7 @@ c_intel_disassembler::c_intel_disassembler(const std::shared_ptr<c_memory>& memo
     }
 }
 
-std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32_t rva) {
+std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32_t rva, const size_t instruction_limit) {
     const std::lock_guard decoder_guard(m_decoder_mtx);
 
     if (const auto &mapped_image = m_memory->get_mapped_image();
@@ -28,6 +28,8 @@ std::shared_ptr<c_intel_function> c_intel_disassembler::disassemble(const uint32
         .function = fn.get(),
         .rva_to_bb_index = {},
         .pending = {},
+        .instruction_limit = instruction_limit,
+        .instruction_count = 0,
     };
 
     ctx.pending.push_back(rva);
@@ -147,7 +149,7 @@ c_intel_instruction c_intel_disassembler::disassemble_instruction(uint32_t rva) 
     return c_intel_instruction(rva, instruction, operands);
 }
 
-std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_walk_ctx &ctx) {
+std::optional<size_t> c_intel_disassembler::walk_basic_block(const uint32_t rva, s_walk_ctx &ctx) const {
     if (const auto it = ctx.rva_to_bb_index.find(rva); it != ctx.rva_to_bb_index.end()) {
         return it->second;
     }
@@ -178,7 +180,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
 
         auto &bb = ctx.function->m_basic_blocks[block_index];
 
-        if (cursor + ZYDIS_MAX_INSTRUCTION_LENGTH > mapped_image.size()) {
+        if (static_cast<size_t>(cursor) + ZYDIS_MAX_INSTRUCTION_LENGTH > mapped_image.size()) {
             break;
         }
 
@@ -197,6 +199,10 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             return std::nullopt;
         }
 
+        if (ctx.instruction_limit && ++ctx.instruction_count >= ctx.instruction_limit) {
+            return std::nullopt;
+        }
+
         c_intel_instruction instr;
         instr.m_rva = cursor;
         instr.m_instruction = decoded;
@@ -208,21 +214,17 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
         const auto category = decoded.meta.category;
         const auto mnemonic = decoded.mnemonic;
 
-        // ret / int / ud2 are function/block terminators, no successors to follow.
-        if (category == ZYDIS_CATEGORY_RET || category == ZYDIS_CATEGORY_INTERRUPT || mnemonic == ZYDIS_MNEMONIC_UD2) {
-            if (category == ZYDIS_CATEGORY_RET) {
-                bb.m_is_final = true;
-            } else {
-                bb.m_end_rva = cursor;
-            }
-
+        // Returns, interrupts and undefined instructions end exploration.
+        if (category == ZYDIS_CATEGORY_RET || category == ZYDIS_CATEGORY_INTERRUPT ||
+            mnemonic == ZYDIS_MNEMONIC_UD0 || mnemonic == ZYDIS_MNEMONIC_UD1 || mnemonic == ZYDIS_MNEMONIC_UD2) {
+            bb.m_is_final = true;
             bb.m_instructions.push_back(instr);
             break;
         }
 
         if (mnemonic == ZYDIS_MNEMONIC_JMP) {
             if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                // indirect jump , treat as function exit.
+                // indirect jump, treat as function exit
                 bb.m_is_final = true;
                 bb.m_instructions.push_back(instr);
                 break;
@@ -240,7 +242,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             break;
         }
 
-        // conditional branch — analyze both target and fallthrough.
+        // conditional branch: queue both the target and the fallthrough
         if (category == ZYDIS_CATEGORY_COND_BR) {
             if (operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 return std::nullopt;
@@ -262,7 +264,7 @@ std::optional<size_t> c_intel_disassembler::walk_basic_block(uint32_t rva, s_wal
             break;
         }
 
-        // ordinary instruction — extend the block and continue.
+        // ordinary instruction, extend the block and continue
         bb.m_instructions.push_back(instr);
         cursor += decoded.length;
     }
